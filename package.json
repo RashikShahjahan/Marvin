@@ -4,6 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "cli": "bun run cli.ts",
     "test": "bun test tests"
   },
   "devDependencies": {
