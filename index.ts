@@ -122,27 +122,11 @@ app.patch("/agents/:id", (request: Request, response: Response) => {
 		return;
 	}
 
-	const changes: AgentUpdate = {};
-
-	if (parseResult.data.name !== undefined) {
-		changes.name = parseResult.data.name;
-	}
-
-	if (parseResult.data.description !== undefined) {
-		changes.description = parseResult.data.description;
-	}
-
-	if (parseResult.data.instructions !== undefined) {
-		changes.instructions = parseResult.data.instructions;
-	}
-
-	if (parseResult.data.model !== undefined) {
-		changes.model = parseResult.data.model;
-	}
-
-	if (parseResult.data.tools !== undefined) {
-		changes.tools = storedTools(parseResult.data.tools);
-	}
+	const { tools, ...fields } = parseResult.data;
+	const changes: AgentUpdate = {
+		...fields,
+		...(tools !== undefined ? { tools: storedTools(tools) } : {}),
+	};
 
 	const agent = updateAgent(params.id, changes);
 
