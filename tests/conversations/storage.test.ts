@@ -3,18 +3,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { parseAgentMessages } from "./agent.ts";
 
-const testDirectory = mkdtempSync(join(tmpdir(), "marvin-conversations-"));
+const testDirectory = mkdtempSync(
+	join(tmpdir(), "marvin-conversation-storage-"),
+);
 const databasePath = join(testDirectory, "agents.sqlite");
 const originalDatabasePath = process.env.AGENTS_DB_PATH;
 
 let sqlite: Database;
-let db: typeof import("./db.ts");
+let db: typeof import("../../db.ts");
 
 beforeAll(async () => {
 	process.env.AGENTS_DB_PATH = databasePath;
-	db = await import(`./db.ts?conversations=${Date.now()}`);
+	db = await import(`../../db.ts?conversationStorage=${Date.now()}`);
 	sqlite = new Database(databasePath, {
 		readonly: true,
 		create: false,
@@ -33,7 +34,7 @@ type TableRow = {
 	name: string;
 };
 
-describe("conversations database support", () => {
+describe("conversation storage", () => {
 	test("creates the conversations table", () => {
 		const row = sqlite
 			.query<TableRow, [string]>(
@@ -83,26 +84,5 @@ describe("conversations database support", () => {
 
 		expect(conversation?.messages).toBe(messages);
 		expect(conversation?.updatedAt).toBe(updatedAt);
-	});
-});
-
-describe("conversation message parsing", () => {
-	test("parses stored agent messages", () => {
-		const messages = JSON.stringify([
-			{
-				role: "user",
-				content: "Remember this.",
-				timestamp: Date.now(),
-			},
-		]);
-
-		expect(parseAgentMessages(messages)).toHaveLength(1);
-	});
-
-	test("rejects invalid stored messages", () => {
-		expect(parseAgentMessages("not json")).toBeUndefined();
-		expect(
-			parseAgentMessages(JSON.stringify([{ role: "system" }])),
-		).toBeUndefined();
 	});
 });

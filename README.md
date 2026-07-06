@@ -23,20 +23,27 @@ AGENTS_DB_PATH=agents.test.sqlite bun run index.ts
 
 ## Run tests
 
-Start the server in one terminal, then run the test suite in another terminal:
+Test files live in the `tests/` directory, use the `*.test.ts` naming convention,
+and are grouped by feature:
 
-```bash
-bun run tests.ts
+```text
+tests/
+  agents.test.ts
+  agent-responses.test.ts
+  conversations/
+    messages.test.ts
+    storage.test.ts
+  support/
+    api.ts
 ```
 
-If the server is running on a different URL or using a different database file,
-pass the same settings to the tests:
+Run the full suite with:
 
 ```bash
-AGENTS_API_BASE_URL=http://localhost:3000 \
-AGENTS_DB_PATH=agents.test.sqlite \
-bun run tests.ts
+bun test
 ```
+
+The API tests start their own server with an isolated temporary database.
 
 This project was created using `bun init` in bun v1.3.14.
 [Bun](https://bun.com) is a fast all-in-one JavaScript runtime.
