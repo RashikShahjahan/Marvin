@@ -14,8 +14,8 @@ import {
 const app: Express = express();
 const port = 3000;
 
-const modelSchema = z.enum(["gpt-4.1", "gpt-4.1-mini"]);
-const toolSchema = z.enum(["web_search", "file_reader"]);
+const modelSchema = z.string().min(1);
+const toolSchema = z.string().min(1);
 const toolsSchema = z.array(toolSchema);
 const createAgentSchema = z
 	.object({

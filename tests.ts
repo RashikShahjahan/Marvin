@@ -18,6 +18,8 @@ const client = axios.create({
 
 const primaryModel = "gpt-4.1";
 const miniModel = "gpt-4.1-mini";
+const customModel = "custom-reasoning-model";
+const customTool = "custom_search";
 
 const agentsTable = sqliteTable("agents", {
 	id: text("id").primaryKey(),
@@ -134,6 +136,17 @@ function expectEqual(label: string, actual: unknown, expected: unknown): void {
 	if (!passed) {
 		process.exitCode = 1;
 	}
+}
+
+function expectAgentResponseMessageOnly(label: string, data: unknown): void {
+	if (!isObject(data)) {
+		process.stdout.write(`${"FAIL"} ${label} expected response body object\n`);
+		process.exitCode = 1;
+		return;
+	}
+
+	expectEqual(`${label} response key count`, Object.keys(data).length, 1);
+	expectEqual(`${label} response message type`, typeof data.message, "string");
 }
 
 function expectDatabaseAgent(
@@ -264,26 +277,48 @@ async function runAgentApiRequests(): Promise<void> {
 		}),
 	);
 
-	await expectStatus(
-		"7. Create Agent - invalid model",
-		400,
+	const createCustomModelResponse = await expectStatus(
+		"7. Create Agent - custom model",
+		201,
 		client.post("/agents", {
-			name: "Invalid Model Agent",
+			name: "Custom Model Agent",
 			instructions: "You are a helpful assistant.",
-			model: "unknown-model",
+			model: customModel,
 		}),
 	);
+	const customModelAgentId = getAgentId(
+		"7. Create Agent - custom model",
+		createCustomModelResponse?.data,
+	);
+	expectDatabaseAgent("7. Create Agent - custom model", customModelAgentId, {
+		name: "Custom Model Agent",
+		description: null,
+		instructions: "You are a helpful assistant.",
+		model: customModel,
+		tools: null,
+	});
 
-	await expectStatus(
-		"8. Create Agent - invalid tools",
-		400,
+	const createCustomToolsResponse = await expectStatus(
+		"8. Create Agent - custom tools",
+		201,
 		client.post("/agents", {
 			name: "Tool Agent",
 			instructions: "You use tools when needed.",
 			model: primaryModel,
-			tools: ["unsupported_tool"],
+			tools: [customTool],
 		}),
 	);
+	const customToolsAgentId = getAgentId(
+		"8. Create Agent - custom tools",
+		createCustomToolsResponse?.data,
+	);
+	expectDatabaseAgent("8. Create Agent - custom tools", customToolsAgentId, {
+		name: "Tool Agent",
+		description: null,
+		instructions: "You use tools when needed.",
+		model: primaryModel,
+		tools: JSON.stringify([customTool]),
+	});
 
 	await expectStatus(
 		"9. Create Agent - disallowed metadata field",
@@ -310,7 +345,7 @@ async function runAgentApiRequests(): Promise<void> {
 	);
 	expectDatabaseAgentCount(
 		"10. Create Agent - invalid create requests",
-		initialAgentCount + 2,
+		initialAgentCount + 4,
 	);
 
 	await expectStatusForAgent(
@@ -464,12 +499,12 @@ async function runAgentApiRequests(): Promise<void> {
 	);
 
 	await expectStatusForAgent(
-		"21. Update Agent - invalid model",
-		400,
+		"21. Update Agent - custom model",
+		200,
 		agentId,
 		(id) =>
 			client.patch(`/agents/${id}`, {
-				model: "unknown-model",
+				model: customModel,
 			}),
 	);
 
@@ -498,7 +533,7 @@ async function runAgentApiRequests(): Promise<void> {
 		name: "Technical Support Agent",
 		description: "Answers technical support questions.",
 		instructions: "You help users troubleshoot technical issues.",
-		model: primaryModel,
+		model: customModel,
 		tools: JSON.stringify(["web_search", "file_reader"]),
 	});
 
@@ -552,6 +587,97 @@ async function runAgentApiRequests(): Promise<void> {
 				limit: 20,
 				cursor: "next_cursor_value",
 			},
+		}),
+	);
+
+	const validAgentResponse = await expectStatusForAgent(
+		"32. Create Agent Response - valid request",
+		200,
+		existingAgentId,
+		(id) =>
+			client.post("/agent/responses", {
+				agent_id: id,
+				message: "What can you help me with?",
+			}),
+	);
+
+	if (validAgentResponse?.status === 200) {
+		expectAgentResponseMessageOnly(
+			"32. Create Agent Response - valid request",
+			validAgentResponse.data,
+		);
+	}
+
+	const modelOverrideResponse = await expectStatusForAgent(
+		"33. Create Agent Response - model override",
+		200,
+		existingAgentId,
+		(id) =>
+			client.post("/agent/responses", {
+				agent_id: id,
+				model: customModel,
+				message: "Use the override model for this response.",
+			}),
+	);
+
+	if (modelOverrideResponse?.status === 200) {
+		expectAgentResponseMessageOnly(
+			"33. Create Agent Response - model override",
+			modelOverrideResponse.data,
+		);
+	}
+
+	await expectStatus(
+		"34. Create Agent Response - missing agent_id",
+		400,
+		client.post("/agent/responses", {
+			message: "What can you help me with?",
+		}),
+	);
+
+	await expectStatus(
+		"35. Create Agent Response - missing message",
+		400,
+		client.post("/agent/responses", {
+			agent_id: existingAgentId,
+		}),
+	);
+
+	await expectStatus(
+		"36. Create Agent Response - empty message",
+		400,
+		client.post("/agent/responses", {
+			agent_id: existingAgentId,
+			message: "",
+		}),
+	);
+
+	await expectStatus(
+		"37. Create Agent Response - empty model",
+		400,
+		client.post("/agent/responses", {
+			agent_id: existingAgentId,
+			model: "",
+			message: "What can you help me with?",
+		}),
+	);
+
+	await expectStatus(
+		"38. Create Agent Response - disallowed role field",
+		400,
+		client.post("/agent/responses", {
+			agent_id: existingAgentId,
+			message: "What can you help me with?",
+			role: "assistant",
+		}),
+	);
+
+	await expectStatus(
+		"39. Create Agent Response - nonexistent agent",
+		404,
+		client.post("/agent/responses", {
+			agent_id: missingAgentId,
+			message: "What can you help me with?",
 		}),
 	);
 
