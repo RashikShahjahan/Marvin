@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express, { type Express, type Request, type Response } from "express";
 import { z } from "zod";
+import { createAgentResponse } from "./agent.ts";
 import {
 	createAgent,
 	deleteAgent,
@@ -36,6 +37,12 @@ const updateAgentSchema = z
 	})
 	.strict()
 	.refine((agent) => Object.keys(agent).length > 0);
+const createAgentResponseSchema = z
+	.object({
+		agent_id: z.string().min(1),
+		message: z.string().min(1),
+	})
+	.strict();
 
 const agentParamsSchema = z.object({
 	id: z.string(),
@@ -98,6 +105,31 @@ app.get("/agents", (_request: Request, response: Response) => {
 	response.json({
 		data: listAgents().map(toAgentResponse),
 		next_cursor: null,
+	});
+});
+
+app.post("/agent/responses", async (request: Request, response: Response) => {
+	const parseResult = createAgentResponseSchema.safeParse(request.body);
+
+	if (!parseResult.success) {
+		response.sendStatus(400);
+		return;
+	}
+
+	const agent = getAgent(parseResult.data.agent_id);
+
+	if (agent === undefined) {
+		response.sendStatus(404);
+		return;
+	}
+
+	const message = await createAgentResponse(
+		agent.instructions,
+		parseResult.data.message,
+	);
+
+	response.json({
+		message,
 	});
 });
 

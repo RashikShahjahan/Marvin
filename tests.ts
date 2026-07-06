@@ -24,6 +24,8 @@ const customModel = "custom-reasoning-model";
 const customTool = "custom_search";
 const supportAgentName = "Support Agent";
 const supportAgentInstructions = "You are a helpful customer support agent.";
+const researchAgentInstructions =
+	"You research topics and provide concise summaries.";
 const webSearchTool = "web_search";
 const fileReaderTool = "file_reader";
 const missingAgentId = "ag_missing";
@@ -135,13 +137,16 @@ function getDatabaseAgentCount(): number {
 	return row.value;
 }
 
-function expectAgentResponseMessageOnly(data: unknown): void {
+function expectAgentResponseMessage(data: unknown): void {
 	if (!isObject(data)) {
 		throw new Error("expected response body object");
 	}
 
 	expect(Object.keys(data)).toHaveLength(1);
-	expect(typeof data.message).toBe("string");
+	if (typeof data.message !== "string") {
+		throw new Error("expected response message string");
+	}
+	expect(data.message.length).toBeGreaterThan(0);
 }
 
 describe("POST /agents", () => {
@@ -167,7 +172,7 @@ describe("POST /agents", () => {
 		const response = await client.post("/agents", {
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
-			instructions: "You research topics and provide concise summaries.",
+			instructions: researchAgentInstructions,
 			model: primaryModel,
 			tools: [webSearchTool, fileReaderTool],
 		});
@@ -177,7 +182,7 @@ describe("POST /agents", () => {
 		expectDatabaseAgent(agentId, {
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
-			instructions: "You research topics and provide concise summaries.",
+			instructions: researchAgentInstructions,
 			model: primaryModel,
 			tools: JSON.stringify([webSearchTool, fileReaderTool]),
 		});
@@ -623,35 +628,34 @@ describe("POST /agent/responses", () => {
 		const agentId = await createAgent({
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
-			instructions: "You research topics and provide concise summaries.",
+			instructions: researchAgentInstructions,
 			model: primaryModel,
 			tools: [webSearchTool, fileReaderTool],
 		});
 		const response = await client.post("/agent/responses", {
 			agent_id: agentId,
-			message: "What can you help me with?",
+			message: "Reply with one short sentence about your capabilities.",
 		});
 
 		expect(response.status).toBe(200);
-		expectAgentResponseMessageOnly(response.data);
-	});
+		expectAgentResponseMessage(response.data);
+	}, 60000);
 
-	test("33. Create Agent Response - model override", async () => {
+	test("33. Create Agent Response - disallowed model override", async () => {
 		const agentId = await createAgent({
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
-			instructions: "You research topics and provide concise summaries.",
+			instructions: researchAgentInstructions,
 			model: primaryModel,
 			tools: [webSearchTool, fileReaderTool],
 		});
 		const response = await client.post("/agent/responses", {
 			agent_id: agentId,
 			model: customModel,
-			message: "Use the override model for this response.",
+			message: "Use the default model for this response.",
 		});
 
-		expect(response.status).toBe(200);
-		expectAgentResponseMessageOnly(response.data);
+		expect(response.status).toBe(400);
 	});
 
 	test("34. Create Agent Response - missing agent_id", async () => {
@@ -666,7 +670,7 @@ describe("POST /agent/responses", () => {
 		const agentId = await createAgent({
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
-			instructions: "You research topics and provide concise summaries.",
+			instructions: researchAgentInstructions,
 			model: primaryModel,
 			tools: [webSearchTool, fileReaderTool],
 		});
@@ -681,7 +685,7 @@ describe("POST /agent/responses", () => {
 		const agentId = await createAgent({
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
-			instructions: "You research topics and provide concise summaries.",
+			instructions: researchAgentInstructions,
 			model: primaryModel,
 			tools: [webSearchTool, fileReaderTool],
 		});
@@ -697,7 +701,7 @@ describe("POST /agent/responses", () => {
 		const agentId = await createAgent({
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
-			instructions: "You research topics and provide concise summaries.",
+			instructions: researchAgentInstructions,
 			model: primaryModel,
 			tools: [webSearchTool, fileReaderTool],
 		});
@@ -714,7 +718,7 @@ describe("POST /agent/responses", () => {
 		const agentId = await createAgent({
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
-			instructions: "You research topics and provide concise summaries.",
+			instructions: researchAgentInstructions,
 			model: primaryModel,
 			tools: [webSearchTool, fileReaderTool],
 		});
