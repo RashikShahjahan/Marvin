@@ -1,18 +1,20 @@
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { Database } from "bun:sqlite";
-import axios, { type AxiosResponse } from "axios";
-import { count, eq } from "drizzle-orm";
-// pi-lens-ignore: ast-grep:find-import-file-without-extension
-import { drizzle } from "drizzle-orm/bun-sqlite";
-// pi-lens-ignore: ast-grep:find-import-file-without-extension
-import { sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import axios from "axios";
 
 const defaultApiProtocol = "http";
 const defaultApiHost = "localhost";
 const defaultApiPort = "3000";
 const defaultApiBaseUrl = `${defaultApiProtocol}://${defaultApiHost}:${defaultApiPort}`;
 
+const testDirectory = mkdtempSync(join(tmpdir(), "marvin-tests-"));
+const databasePath = join(testDirectory, "agents.sqlite");
+
 const client = axios.create({
-	baseURL: process.env.AGENTS_API_BASE_URL ?? defaultApiBaseUrl,
+	baseURL: defaultApiBaseUrl,
 	validateStatus: () => true,
 });
 
@@ -20,15 +22,22 @@ const primaryModel = "gpt-4.1";
 const miniModel = "gpt-4.1-mini";
 const customModel = "custom-reasoning-model";
 const customTool = "custom_search";
+const supportAgentName = "Support Agent";
+const supportAgentInstructions = "You are a helpful customer support agent.";
+const webSearchTool = "web_search";
+const fileReaderTool = "file_reader";
+const missingAgentId = "ag_missing";
 
-const agentsTable = sqliteTable("agents", {
-	id: text("id").primaryKey(),
-	name: text("name").notNull(),
-	description: text("description"),
-	instructions: text("instructions").notNull(),
-	model: text("model").notNull(),
-	tools: text("tools"),
-});
+let serverProcess: ReturnType<typeof Bun.spawn>;
+let sqlite: Database;
+
+type CreateAgentRequest = {
+	name: string;
+	description?: string;
+	instructions: string;
+	model: string;
+	tools?: string[];
+};
 
 type ExpectedAgentRow = {
 	name: string;
@@ -38,655 +47,692 @@ type ExpectedAgentRow = {
 	tools: string | null;
 };
 
-const databasePath = process.env.AGENTS_DB_PATH ?? "agents.sqlite";
+type AgentRow = ExpectedAgentRow & {
+	id: string;
+};
 
-const sqlite = new Database(databasePath, {
-	readonly: true,
-	create: false,
+type CountRow = {
+	value: number;
+};
+
+beforeAll(async () => {
+	mkdirSync(testDirectory, { recursive: true });
+
+	serverProcess = Bun.spawn(["bun", "index.ts"], {
+		cwd: import.meta.dir,
+		env: {
+			...process.env,
+			AGENTS_DB_PATH: databasePath,
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+
+	await Bun.sleep(500);
+	sqlite = new Database(databasePath, {
+		readonly: true,
+		create: false,
+	});
 });
-const database = drizzle({ client: sqlite });
-const initialAgentCountRow = database
-	.select({ value: count() })
-	.from(agentsTable)
-	.get();
 
-if (initialAgentCountRow === undefined) {
-	throw new Error("agents table count query returned no rows");
-}
-
-const initialAgentCount = initialAgentCountRow.value;
-
-type TestResponse = AxiosResponse<unknown> | undefined;
-
-async function expectStatus(
-	label: string,
-	expectedStatus: number,
-	request: Promise<AxiosResponse<unknown>>,
-): Promise<TestResponse> {
-	try {
-		const response = await request;
-		const passed = response.status === expectedStatus;
-		const result = passed ? "PASS" : "FAIL";
-
-		process.stdout.write(
-			`${result} ${label} expected ${expectedStatus} got ${response.status}\n`,
-		);
-
-		if (!passed) {
-			process.stdout.write(`${JSON.stringify(response.data)}\n`);
-			process.exitCode = 1;
-		}
-
-		return response;
-	} catch (error: unknown) {
-		process.stdout.write(
-			`${"FAIL"} ${label} expected ${expectedStatus} request failed\n`,
-		);
-
-		if (axios.isAxiosError(error)) {
-			process.stdout.write(`${error.message}\n`);
-		}
-
-		process.exitCode = 1;
-		return undefined;
-	}
-}
-
-function expectStatusForAgent(
-	label: string,
-	expectedStatus: number,
-	agentId: string | undefined,
-	request: (id: string) => Promise<AxiosResponse<unknown>>,
-): Promise<TestResponse> {
-	if (agentId === undefined) {
-		process.stdout.write(
-			`${"SKIP"} ${label} missing agent id from create response\n`,
-		);
-		process.exitCode = 1;
-		return Promise.resolve(undefined);
-	}
-
-	return expectStatus(label, expectedStatus, request(agentId));
-}
+afterAll(() => {
+	sqlite.close();
+	serverProcess.kill();
+	rmSync(testDirectory, { recursive: true, force: true });
+});
 
 function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function getAgentId(label: string, data: unknown): string | undefined {
-	if (isObject(data) && typeof data.id === "string") {
-		return data.id;
+function getAgentId(data: unknown): string {
+	if (!isObject(data) || typeof data.id !== "string") {
+		throw new Error("expected response body to include string id");
 	}
 
-	process.stdout.write(
-		`FAIL ${label} expected response body to include string id\n`,
-	);
-	process.exitCode = 1;
-	return undefined;
+	return data.id;
 }
 
-function expectEqual(label: string, actual: unknown, expected: unknown): void {
-	const passed = actual === expected;
-	const result = passed ? "PASS" : "FAIL";
-
-	process.stdout.write(
-		`${result} ${label} expected ${JSON.stringify(expected)} got ${JSON.stringify(actual)}\n`,
-	);
-
-	if (!passed) {
-		process.exitCode = 1;
-	}
-}
-
-function expectAgentResponseMessageOnly(label: string, data: unknown): void {
-	if (!isObject(data)) {
-		process.stdout.write(`${"FAIL"} ${label} expected response body object\n`);
-		process.exitCode = 1;
-		return;
-	}
-
-	expectEqual(`${label} response key count`, Object.keys(data).length, 1);
-	expectEqual(`${label} response message type`, typeof data.message, "string");
+async function createAgent(request: CreateAgentRequest): Promise<string> {
+	const response = await client.post("/agents", request);
+	expect(response.status).toBe(201);
+	return getAgentId(response.data);
 }
 
 function expectDatabaseAgent(
-	label: string,
-	agentId: string | undefined,
+	agentId: string,
 	expected: ExpectedAgentRow,
 ): void {
-	if (agentId === undefined) {
-		process.stdout.write(`${"SKIP"} ${label} missing agent id\n`);
-		process.exitCode = 1;
-		return;
+	const row = sqlite
+		.query<AgentRow, [string]>(
+			`SELECT id, name, description, instructions, model, tools
+			FROM agents
+			WHERE id = ?`,
+		)
+		.get(agentId);
+
+	if (row === null) {
+		throw new Error("expected database agent row");
 	}
 
-	const row = database
-		.select()
-		.from(agentsTable)
-		.where(eq(agentsTable.id, agentId))
+	expect(row.id).toBe(agentId);
+	expect(row.name).toBe(expected.name);
+	expect(row.description).toBe(expected.description);
+	expect(row.instructions).toBe(expected.instructions);
+	expect(row.model).toBe(expected.model);
+	expect(row.tools).toBe(expected.tools);
+}
+
+function getDatabaseAgentCount(): number {
+	const row = sqlite
+		.query<CountRow, []>("SELECT count(*) AS value FROM agents")
 		.get();
 
-	if (row === undefined) {
-		process.stdout.write(`${"FAIL"} ${label} expected database agent row\n`);
-		process.exitCode = 1;
-		return;
+	if (row === null) {
+		throw new Error("agents table count query returned no rows");
 	}
 
-	expectEqual(`${label} database id`, row.id, agentId);
-	expectEqual(`${label} database name`, row.name, expected.name);
-	expectEqual(
-		`${label} database description`,
-		row.description,
-		expected.description,
-	);
-	expectEqual(
-		`${label} database instructions`,
-		row.instructions,
-		expected.instructions,
-	);
-	expectEqual(`${label} database model`, row.model, expected.model);
-	expectEqual(`${label} database tools`, row.tools, expected.tools);
+	return row.value;
 }
 
-function expectDatabaseAgentCount(label: string, expectedCount: number): void {
-	const row = database.select({ value: count() }).from(agentsTable).get();
-	expectEqual(`${label} database agent count`, row?.value, expectedCount);
+function expectAgentResponseMessageOnly(data: unknown): void {
+	if (!isObject(data)) {
+		throw new Error("expected response body object");
+	}
+
+	expect(Object.keys(data)).toHaveLength(1);
+	expect(typeof data.message).toBe("string");
 }
 
-async function runAgentApiRequests(): Promise<void> {
-	const missingAgentId = "ag_missing";
-
-	const createMinimalResponse = await expectStatus(
-		"1. Create Agent - valid minimal request",
-		201,
-		client.post("/agents", {
-			name: "Support Agent",
-			instructions: "You are a helpful customer support agent.",
+describe("POST /agents", () => {
+	test("1. Create Agent - valid minimal request", async () => {
+		const response = await client.post("/agents", {
+			name: supportAgentName,
+			instructions: supportAgentInstructions,
 			model: primaryModel,
-		}),
-	);
-	const agentId = getAgentId(
-		"1. Create Agent - valid minimal request",
-		createMinimalResponse?.data,
-	);
-	expectDatabaseAgent("1. Create Agent - valid minimal request", agentId, {
-		name: "Support Agent",
-		description: null,
-		instructions: "You are a helpful customer support agent.",
-		model: primaryModel,
-		tools: null,
+		});
+
+		expect(response.status).toBe(201);
+		const agentId = getAgentId(response.data);
+		expectDatabaseAgent(agentId, {
+			name: supportAgentName,
+			description: null,
+			instructions: supportAgentInstructions,
+			model: primaryModel,
+			tools: null,
+		});
 	});
 
-	const createFullResponse = await expectStatus(
-		"2. Create Agent - valid full request",
-		201,
-		client.post("/agents", {
+	test("2. Create Agent - valid full request", async () => {
+		const response = await client.post("/agents", {
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
 			instructions: "You research topics and provide concise summaries.",
 			model: primaryModel,
-			tools: ["web_search", "file_reader"],
-		}),
-	);
-	const existingAgentId = getAgentId(
-		"2. Create Agent - valid full request",
-		createFullResponse?.data,
-	);
-	expectDatabaseAgent("2. Create Agent - valid full request", existingAgentId, {
-		name: "Research Agent",
-		description: "Finds and summarizes technical information.",
-		instructions: "You research topics and provide concise summaries.",
-		model: primaryModel,
-		tools: JSON.stringify(["web_search", "file_reader"]),
+			tools: [webSearchTool, fileReaderTool],
+		});
+
+		expect(response.status).toBe(201);
+		const agentId = getAgentId(response.data);
+		expectDatabaseAgent(agentId, {
+			name: "Research Agent",
+			description: "Finds and summarizes technical information.",
+			instructions: "You research topics and provide concise summaries.",
+			model: primaryModel,
+			tools: JSON.stringify([webSearchTool, fileReaderTool]),
+		});
 	});
 
-	await expectStatus(
-		"3. Create Agent - missing name",
-		400,
-		client.post("/agents", {
+	test("3. Create Agent - missing name", async () => {
+		const response = await client.post("/agents", {
 			instructions: "You are a helpful assistant.",
 			model: primaryModel,
-		}),
-	);
+		});
 
-	await expectStatus(
-		"4. Create Agent - missing instructions",
-		400,
-		client.post("/agents", {
+		expect(response.status).toBe(400);
+	});
+
+	test("4. Create Agent - missing instructions", async () => {
+		const response = await client.post("/agents", {
 			name: "Broken Agent",
 			model: primaryModel,
-		}),
-	);
+		});
 
-	await expectStatus(
-		"5. Create Agent - missing model",
-		400,
-		client.post("/agents", {
+		expect(response.status).toBe(400);
+	});
+
+	test("5. Create Agent - missing model", async () => {
+		const response = await client.post("/agents", {
 			name: "Broken Agent",
 			instructions: "You are a helpful assistant.",
-		}),
-	);
+		});
 
-	await expectStatus(
-		"6. Create Agent - empty name",
-		400,
-		client.post("/agents", {
+		expect(response.status).toBe(400);
+	});
+
+	test("6. Create Agent - empty name", async () => {
+		const response = await client.post("/agents", {
 			name: "",
 			instructions: "You are a helpful assistant.",
 			model: primaryModel,
-		}),
-	);
+		});
 
-	const createCustomModelResponse = await expectStatus(
-		"7. Create Agent - custom model",
-		201,
-		client.post("/agents", {
+		expect(response.status).toBe(400);
+	});
+
+	test("7. Create Agent - custom model", async () => {
+		const response = await client.post("/agents", {
 			name: "Custom Model Agent",
 			instructions: "You are a helpful assistant.",
 			model: customModel,
-		}),
-	);
-	const customModelAgentId = getAgentId(
-		"7. Create Agent - custom model",
-		createCustomModelResponse?.data,
-	);
-	expectDatabaseAgent("7. Create Agent - custom model", customModelAgentId, {
-		name: "Custom Model Agent",
-		description: null,
-		instructions: "You are a helpful assistant.",
-		model: customModel,
-		tools: null,
+		});
+
+		expect(response.status).toBe(201);
+		const agentId = getAgentId(response.data);
+		expectDatabaseAgent(agentId, {
+			name: "Custom Model Agent",
+			description: null,
+			instructions: "You are a helpful assistant.",
+			model: customModel,
+			tools: null,
+		});
 	});
 
-	const createCustomToolsResponse = await expectStatus(
-		"8. Create Agent - custom tools",
-		201,
-		client.post("/agents", {
+	test("8. Create Agent - custom tools", async () => {
+		const response = await client.post("/agents", {
 			name: "Tool Agent",
 			instructions: "You use tools when needed.",
 			model: primaryModel,
 			tools: [customTool],
-		}),
-	);
-	const customToolsAgentId = getAgentId(
-		"8. Create Agent - custom tools",
-		createCustomToolsResponse?.data,
-	);
-	expectDatabaseAgent("8. Create Agent - custom tools", customToolsAgentId, {
-		name: "Tool Agent",
-		description: null,
-		instructions: "You use tools when needed.",
-		model: primaryModel,
-		tools: JSON.stringify([customTool]),
+		});
+
+		expect(response.status).toBe(201);
+		const agentId = getAgentId(response.data);
+		expectDatabaseAgent(agentId, {
+			name: "Tool Agent",
+			description: null,
+			instructions: "You use tools when needed.",
+			model: primaryModel,
+			tools: JSON.stringify([customTool]),
+		});
 	});
 
-	await expectStatus(
-		"9. Create Agent - disallowed metadata field",
-		400,
-		client.post("/agents", {
+	test("9. Create Agent - disallowed metadata field", async () => {
+		const response = await client.post("/agents", {
 			name: "Metadata Agent",
 			instructions: "You are a helpful assistant.",
 			model: primaryModel,
 			metadata: {
 				team: "support",
 			},
-		}),
-	);
+		});
 
-	await expectStatus(
-		"10. Create Agent - disallowed status field",
-		400,
-		client.post("/agents", {
+		expect(response.status).toBe(400);
+	});
+
+	test("10. Create Agent - disallowed status field", async () => {
+		const initialAgentCount = getDatabaseAgentCount();
+		const response = await client.post("/agents", {
 			name: "Status Agent",
 			instructions: "You are a helpful assistant.",
 			model: primaryModel,
 			status: "active",
-		}),
-	);
-	expectDatabaseAgentCount(
-		"10. Create Agent - invalid create requests",
-		initialAgentCount + 4,
-	);
+		});
 
-	await expectStatusForAgent(
-		"11. Update Agent - name only",
-		200,
-		agentId,
-		(id) =>
-			client.patch(`/agents/${id}`, {
-				name: "Updated Support Agent",
-			}),
-	);
-	expectDatabaseAgent("11. Update Agent - name only", agentId, {
-		name: "Updated Support Agent",
-		description: null,
-		instructions: "You are a helpful customer support agent.",
-		model: primaryModel,
-		tools: null,
+		expect(response.status).toBe(400);
+		expect(getDatabaseAgentCount()).toBe(initialAgentCount);
+	});
+});
+
+describe("PATCH /agents/:id", () => {
+	test("11. Update Agent - name only", async () => {
+		const agentId = await createAgent({
+			name: supportAgentName,
+			instructions: supportAgentInstructions,
+			model: primaryModel,
+		});
+		const response = await client.patch(`/agents/${agentId}`, {
+			name: "Updated Support Agent",
+		});
+
+		expect(response.status).toBe(200);
+		expectDatabaseAgent(agentId, {
+			name: "Updated Support Agent",
+			description: null,
+			instructions: supportAgentInstructions,
+			model: primaryModel,
+			tools: null,
+		});
 	});
 
-	await expectStatusForAgent(
-		"12. Update Agent - description only",
-		200,
-		agentId,
-		(id) =>
-			client.patch(`/agents/${id}`, {
-				description: "Handles customer support conversations.",
-			}),
-	);
-	expectDatabaseAgent("12. Update Agent - description only", agentId, {
-		name: "Updated Support Agent",
-		description: "Handles customer support conversations.",
-		instructions: "You are a helpful customer support agent.",
-		model: primaryModel,
-		tools: null,
+	test("12. Update Agent - description only", async () => {
+		const agentId = await createAgent({
+			name: supportAgentName,
+			instructions: supportAgentInstructions,
+			model: primaryModel,
+		});
+		const response = await client.patch(`/agents/${agentId}`, {
+			description: "Handles customer support conversations.",
+		});
+
+		expect(response.status).toBe(200);
+		expectDatabaseAgent(agentId, {
+			name: supportAgentName,
+			description: "Handles customer support conversations.",
+			instructions: supportAgentInstructions,
+			model: primaryModel,
+			tools: null,
+		});
 	});
 
-	await expectStatusForAgent(
-		"13. Update Agent - clear description",
-		200,
-		agentId,
-		(id) =>
-			client.patch(`/agents/${id}`, {
-				description: null,
-			}),
-	);
-	expectDatabaseAgent("13. Update Agent - clear description", agentId, {
-		name: "Updated Support Agent",
-		description: null,
-		instructions: "You are a helpful customer support agent.",
-		model: primaryModel,
-		tools: null,
+	test("13. Update Agent - clear description", async () => {
+		const agentId = await createAgent({
+			name: supportAgentName,
+			description: "Handles customer support conversations.",
+			instructions: supportAgentInstructions,
+			model: primaryModel,
+		});
+		const response = await client.patch(`/agents/${agentId}`, {
+			description: null,
+		});
+
+		expect(response.status).toBe(200);
+		expectDatabaseAgent(agentId, {
+			name: supportAgentName,
+			description: null,
+			instructions: supportAgentInstructions,
+			model: primaryModel,
+			tools: null,
+		});
 	});
 
-	await expectStatusForAgent(
-		"14. Update Agent - instructions only",
-		200,
-		agentId,
-		(id) =>
-			client.patch(`/agents/${id}`, {
-				instructions: "You are a concise and professional support agent.",
-			}),
-	);
-	expectDatabaseAgent("14. Update Agent - instructions only", agentId, {
-		name: "Updated Support Agent",
-		description: null,
-		instructions: "You are a concise and professional support agent.",
-		model: primaryModel,
-		tools: null,
+	test("14. Update Agent - instructions only", async () => {
+		const agentId = await createAgent({
+			name: supportAgentName,
+			instructions: supportAgentInstructions,
+			model: primaryModel,
+		});
+		const response = await client.patch(`/agents/${agentId}`, {
+			instructions: "You are a concise and professional support agent.",
+		});
+
+		expect(response.status).toBe(200);
+		expectDatabaseAgent(agentId, {
+			name: supportAgentName,
+			description: null,
+			instructions: "You are a concise and professional support agent.",
+			model: primaryModel,
+			tools: null,
+		});
 	});
 
-	await expectStatusForAgent(
-		"15. Update Agent - model only",
-		200,
-		agentId,
-		(id) =>
-			client.patch(`/agents/${id}`, {
-				model: miniModel,
-			}),
-	);
-	expectDatabaseAgent("15. Update Agent - model only", agentId, {
-		name: "Updated Support Agent",
-		description: null,
-		instructions: "You are a concise and professional support agent.",
-		model: miniModel,
-		tools: null,
+	test("15. Update Agent - model only", async () => {
+		const agentId = await createAgent({
+			name: supportAgentName,
+			instructions: "You are a concise and professional support agent.",
+			model: primaryModel,
+		});
+		const response = await client.patch(`/agents/${agentId}`, {
+			model: miniModel,
+		});
+
+		expect(response.status).toBe(200);
+		expectDatabaseAgent(agentId, {
+			name: supportAgentName,
+			description: null,
+			instructions: "You are a concise and professional support agent.",
+			model: miniModel,
+			tools: null,
+		});
 	});
 
-	await expectStatusForAgent(
-		"16. Update Agent - tools only",
-		200,
-		agentId,
-		(id) =>
-			client.patch(`/agents/${id}`, {
-				tools: ["web_search"],
-			}),
-	);
-	expectDatabaseAgent("16. Update Agent - tools only", agentId, {
-		name: "Updated Support Agent",
-		description: null,
-		instructions: "You are a concise and professional support agent.",
-		model: miniModel,
-		tools: JSON.stringify(["web_search"]),
+	test("16. Update Agent - tools only", async () => {
+		const agentId = await createAgent({
+			name: supportAgentName,
+			instructions: "You are a concise and professional support agent.",
+			model: miniModel,
+		});
+		const response = await client.patch(`/agents/${agentId}`, {
+			tools: [webSearchTool],
+		});
+
+		expect(response.status).toBe(200);
+		expectDatabaseAgent(agentId, {
+			name: supportAgentName,
+			description: null,
+			instructions: "You are a concise and professional support agent.",
+			model: miniModel,
+			tools: JSON.stringify([webSearchTool]),
+		});
 	});
 
-	await expectStatusForAgent(
-		"17. Update Agent - full update",
-		200,
-		agentId,
-		(id) =>
-			client.patch(`/agents/${id}`, {
-				name: "Technical Support Agent",
-				description: "Answers technical support questions.",
-				instructions: "You help users troubleshoot technical issues.",
-				model: primaryModel,
-				tools: ["web_search", "file_reader"],
-			}),
-	);
-	expectDatabaseAgent("17. Update Agent - full update", agentId, {
-		name: "Technical Support Agent",
-		description: "Answers technical support questions.",
-		instructions: "You help users troubleshoot technical issues.",
-		model: primaryModel,
-		tools: JSON.stringify(["web_search", "file_reader"]),
+	test("17. Update Agent - full update", async () => {
+		const agentId = await createAgent({
+			name: supportAgentName,
+			instructions: "You are a concise and professional support agent.",
+			model: miniModel,
+			tools: [webSearchTool],
+		});
+		const response = await client.patch(`/agents/${agentId}`, {
+			name: "Technical Support Agent",
+			description: "Answers technical support questions.",
+			instructions: "You help users troubleshoot technical issues.",
+			model: primaryModel,
+			tools: [webSearchTool, fileReaderTool],
+		});
+
+		expect(response.status).toBe(200);
+		expectDatabaseAgent(agentId, {
+			name: "Technical Support Agent",
+			description: "Answers technical support questions.",
+			instructions: "You help users troubleshoot technical issues.",
+			model: primaryModel,
+			tools: JSON.stringify([webSearchTool, fileReaderTool]),
+		});
 	});
 
-	await expectStatusForAgent(
-		"18. Update Agent - empty body",
-		400,
-		agentId,
-		(id) => client.patch(`/agents/${id}`, {}),
-	);
+	test("18. Update Agent - empty body", async () => {
+		const agentId = await createAgent({
+			name: supportAgentName,
+			instructions: supportAgentInstructions,
+			model: primaryModel,
+		});
+		const response = await client.patch(`/agents/${agentId}`, {});
 
-	await expectStatusForAgent(
-		"19. Update Agent - empty name",
-		400,
-		agentId,
-		(id) =>
-			client.patch(`/agents/${id}`, {
-				name: "",
-			}),
-	);
-
-	await expectStatusForAgent(
-		"20. Update Agent - empty instructions",
-		400,
-		agentId,
-		(id) =>
-			client.patch(`/agents/${id}`, {
-				instructions: "",
-			}),
-	);
-
-	await expectStatusForAgent(
-		"21. Update Agent - custom model",
-		200,
-		agentId,
-		(id) =>
-			client.patch(`/agents/${id}`, {
-				model: customModel,
-			}),
-	);
-
-	await expectStatusForAgent(
-		"22. Update Agent - disallowed metadata field",
-		400,
-		agentId,
-		(id) =>
-			client.patch(`/agents/${id}`, {
-				metadata: {
-					team: "support",
-				},
-			}),
-	);
-
-	await expectStatusForAgent(
-		"23. Update Agent - disallowed status field",
-		400,
-		agentId,
-		(id) =>
-			client.patch(`/agents/${id}`, {
-				status: "inactive",
-			}),
-	);
-	expectDatabaseAgent("23. Update Agent - invalid update requests", agentId, {
-		name: "Technical Support Agent",
-		description: "Answers technical support questions.",
-		instructions: "You help users troubleshoot technical issues.",
-		model: customModel,
-		tools: JSON.stringify(["web_search", "file_reader"]),
+		expect(response.status).toBe(400);
 	});
 
-	await expectStatusForAgent(
-		"24. Delete Agent - existing agent",
-		204,
-		agentId,
-		(id) => client.delete(`/agents/${id}`),
-	);
+	test("19. Update Agent - empty name", async () => {
+		const agentId = await createAgent({
+			name: supportAgentName,
+			instructions: supportAgentInstructions,
+			model: primaryModel,
+		});
+		const response = await client.patch(`/agents/${agentId}`, {
+			name: "",
+		});
 
-	await expectStatusForAgent(
-		"25. Delete Agent - already deleted agent",
-		204,
-		agentId,
-		(id) => client.delete(`/agents/${id}`),
-	);
+		expect(response.status).toBe(400);
+	});
 
-	await expectStatus(
-		"26. Delete Agent - nonexistent agent",
-		404,
-		client.delete(`/agents/${missingAgentId}`),
-	);
+	test("20. Update Agent - empty instructions", async () => {
+		const agentId = await createAgent({
+			name: supportAgentName,
+			instructions: supportAgentInstructions,
+			model: primaryModel,
+		});
+		const response = await client.patch(`/agents/${agentId}`, {
+			instructions: "",
+		});
 
-	await expectStatusForAgent(
-		"27. Get Agent - existing agent",
-		200,
-		existingAgentId,
-		(id) => client.get(`/agents/${id}`),
-	);
+		expect(response.status).toBe(400);
+	});
 
-	await expectStatus(
-		"28. Get Agent - nonexistent agent",
-		404,
-		client.get(`/agents/${missingAgentId}`),
-	);
+	test("21. Update Agent - custom model", async () => {
+		const agentId = await createAgent({
+			name: supportAgentName,
+			instructions: supportAgentInstructions,
+			model: primaryModel,
+		});
+		const response = await client.patch(`/agents/${agentId}`, {
+			model: customModel,
+		});
 
-	await expectStatusForAgent(
-		"29. Get Agent - deleted agent",
-		404,
-		agentId,
-		(id) => client.get(`/agents/${id}`),
-	);
+		expect(response.status).toBe(200);
+		expectDatabaseAgent(agentId, {
+			name: supportAgentName,
+			description: null,
+			instructions: supportAgentInstructions,
+			model: customModel,
+			tools: null,
+		});
+	});
 
-	await expectStatus("30. List Agents", 200, client.get("/agents"));
+	test("22. Update Agent - disallowed metadata field", async () => {
+		const agentId = await createAgent({
+			name: "Technical Support Agent",
+			description: "Answers technical support questions.",
+			instructions: "You help users troubleshoot technical issues.",
+			model: customModel,
+			tools: [webSearchTool, fileReaderTool],
+		});
+		const response = await client.patch(`/agents/${agentId}`, {
+			metadata: {
+				team: "support",
+			},
+		});
 
-	await expectStatus(
-		"31. List Agents with pagination",
-		200,
-		client.get("/agents", {
+		expect(response.status).toBe(400);
+		expectDatabaseAgent(agentId, {
+			name: "Technical Support Agent",
+			description: "Answers technical support questions.",
+			instructions: "You help users troubleshoot technical issues.",
+			model: customModel,
+			tools: JSON.stringify([webSearchTool, fileReaderTool]),
+		});
+	});
+
+	test("23. Update Agent - disallowed status field", async () => {
+		const agentId = await createAgent({
+			name: "Technical Support Agent",
+			description: "Answers technical support questions.",
+			instructions: "You help users troubleshoot technical issues.",
+			model: customModel,
+			tools: [webSearchTool, fileReaderTool],
+		});
+		const response = await client.patch(`/agents/${agentId}`, {
+			status: "inactive",
+		});
+
+		expect(response.status).toBe(400);
+		expectDatabaseAgent(agentId, {
+			name: "Technical Support Agent",
+			description: "Answers technical support questions.",
+			instructions: "You help users troubleshoot technical issues.",
+			model: customModel,
+			tools: JSON.stringify([webSearchTool, fileReaderTool]),
+		});
+	});
+});
+
+describe("DELETE /agents/:id", () => {
+	test("24. Delete Agent - existing agent", async () => {
+		const agentId = await createAgent({
+			name: "Delete Agent",
+			instructions: "You are deleted during the test.",
+			model: primaryModel,
+		});
+		const response = await client.delete(`/agents/${agentId}`);
+
+		expect(response.status).toBe(204);
+	});
+
+	test("25. Delete Agent - already deleted agent", async () => {
+		const agentId = await createAgent({
+			name: "Delete Twice Agent",
+			instructions: "You are deleted twice during the test.",
+			model: primaryModel,
+		});
+		const firstResponse = await client.delete(`/agents/${agentId}`);
+		const secondResponse = await client.delete(`/agents/${agentId}`);
+
+		expect(firstResponse.status).toBe(204);
+		expect(secondResponse.status).toBe(204);
+	});
+
+	test("26. Delete Agent - nonexistent agent", async () => {
+		const response = await client.delete(`/agents/${missingAgentId}`);
+
+		expect(response.status).toBe(404);
+	});
+});
+
+describe("GET /agents/:id", () => {
+	test("27. Get Agent - existing agent", async () => {
+		const agentId = await createAgent({
+			name: "Get Agent",
+			instructions: "You are fetched during the test.",
+			model: primaryModel,
+		});
+		const response = await client.get(`/agents/${agentId}`);
+
+		expect(response.status).toBe(200);
+	});
+
+	test("28. Get Agent - nonexistent agent", async () => {
+		const response = await client.get(`/agents/${missingAgentId}`);
+
+		expect(response.status).toBe(404);
+	});
+
+	test("29. Get Agent - deleted agent", async () => {
+		const agentId = await createAgent({
+			name: "Deleted Get Agent",
+			instructions: "You are deleted before fetch.",
+			model: primaryModel,
+		});
+		const deleteResponse = await client.delete(`/agents/${agentId}`);
+		const getResponse = await client.get(`/agents/${agentId}`);
+
+		expect(deleteResponse.status).toBe(204);
+		expect(getResponse.status).toBe(404);
+	});
+});
+
+describe("GET /agents", () => {
+	test("30. List Agents", async () => {
+		const response = await client.get("/agents");
+
+		expect(response.status).toBe(200);
+	});
+
+	test("31. List Agents with pagination", async () => {
+		const response = await client.get("/agents", {
 			params: {
 				limit: 20,
 				cursor: "next_cursor_value",
 			},
-		}),
-	);
+		});
 
-	const validAgentResponse = await expectStatusForAgent(
-		"32. Create Agent Response - valid request",
-		200,
-		existingAgentId,
-		(id) =>
-			client.post("/agent/responses", {
-				agent_id: id,
-				message: "What can you help me with?",
-			}),
-	);
+		expect(response.status).toBe(200);
+	});
+});
 
-	if (validAgentResponse?.status === 200) {
-		expectAgentResponseMessageOnly(
-			"32. Create Agent Response - valid request",
-			validAgentResponse.data,
-		);
-	}
-
-	const modelOverrideResponse = await expectStatusForAgent(
-		"33. Create Agent Response - model override",
-		200,
-		existingAgentId,
-		(id) =>
-			client.post("/agent/responses", {
-				agent_id: id,
-				model: customModel,
-				message: "Use the override model for this response.",
-			}),
-	);
-
-	if (modelOverrideResponse?.status === 200) {
-		expectAgentResponseMessageOnly(
-			"33. Create Agent Response - model override",
-			modelOverrideResponse.data,
-		);
-	}
-
-	await expectStatus(
-		"34. Create Agent Response - missing agent_id",
-		400,
-		client.post("/agent/responses", {
+describe("POST /agent/responses", () => {
+	test("32. Create Agent Response - valid request", async () => {
+		const agentId = await createAgent({
+			name: "Research Agent",
+			description: "Finds and summarizes technical information.",
+			instructions: "You research topics and provide concise summaries.",
+			model: primaryModel,
+			tools: [webSearchTool, fileReaderTool],
+		});
+		const response = await client.post("/agent/responses", {
+			agent_id: agentId,
 			message: "What can you help me with?",
-		}),
-	);
+		});
 
-	await expectStatus(
-		"35. Create Agent Response - missing message",
-		400,
-		client.post("/agent/responses", {
-			agent_id: existingAgentId,
-		}),
-	);
+		expect(response.status).toBe(200);
+		expectAgentResponseMessageOnly(response.data);
+	});
 
-	await expectStatus(
-		"36. Create Agent Response - empty message",
-		400,
-		client.post("/agent/responses", {
-			agent_id: existingAgentId,
+	test("33. Create Agent Response - model override", async () => {
+		const agentId = await createAgent({
+			name: "Research Agent",
+			description: "Finds and summarizes technical information.",
+			instructions: "You research topics and provide concise summaries.",
+			model: primaryModel,
+			tools: [webSearchTool, fileReaderTool],
+		});
+		const response = await client.post("/agent/responses", {
+			agent_id: agentId,
+			model: customModel,
+			message: "Use the override model for this response.",
+		});
+
+		expect(response.status).toBe(200);
+		expectAgentResponseMessageOnly(response.data);
+	});
+
+	test("34. Create Agent Response - missing agent_id", async () => {
+		const response = await client.post("/agent/responses", {
+			message: "What can you help me with?",
+		});
+
+		expect(response.status).toBe(400);
+	});
+
+	test("35. Create Agent Response - missing message", async () => {
+		const agentId = await createAgent({
+			name: "Research Agent",
+			description: "Finds and summarizes technical information.",
+			instructions: "You research topics and provide concise summaries.",
+			model: primaryModel,
+			tools: [webSearchTool, fileReaderTool],
+		});
+		const response = await client.post("/agent/responses", {
+			agent_id: agentId,
+		});
+
+		expect(response.status).toBe(400);
+	});
+
+	test("36. Create Agent Response - empty message", async () => {
+		const agentId = await createAgent({
+			name: "Research Agent",
+			description: "Finds and summarizes technical information.",
+			instructions: "You research topics and provide concise summaries.",
+			model: primaryModel,
+			tools: [webSearchTool, fileReaderTool],
+		});
+		const response = await client.post("/agent/responses", {
+			agent_id: agentId,
 			message: "",
-		}),
-	);
+		});
 
-	await expectStatus(
-		"37. Create Agent Response - empty model",
-		400,
-		client.post("/agent/responses", {
-			agent_id: existingAgentId,
+		expect(response.status).toBe(400);
+	});
+
+	test("37. Create Agent Response - empty model", async () => {
+		const agentId = await createAgent({
+			name: "Research Agent",
+			description: "Finds and summarizes technical information.",
+			instructions: "You research topics and provide concise summaries.",
+			model: primaryModel,
+			tools: [webSearchTool, fileReaderTool],
+		});
+		const response = await client.post("/agent/responses", {
+			agent_id: agentId,
 			model: "",
 			message: "What can you help me with?",
-		}),
-	);
+		});
 
-	await expectStatus(
-		"38. Create Agent Response - disallowed role field",
-		400,
-		client.post("/agent/responses", {
-			agent_id: existingAgentId,
+		expect(response.status).toBe(400);
+	});
+
+	test("38. Create Agent Response - disallowed role field", async () => {
+		const agentId = await createAgent({
+			name: "Research Agent",
+			description: "Finds and summarizes technical information.",
+			instructions: "You research topics and provide concise summaries.",
+			model: primaryModel,
+			tools: [webSearchTool, fileReaderTool],
+		});
+		const response = await client.post("/agent/responses", {
+			agent_id: agentId,
 			message: "What can you help me with?",
 			role: "assistant",
-		}),
-	);
+		});
 
-	await expectStatus(
-		"39. Create Agent Response - nonexistent agent",
-		404,
-		client.post("/agent/responses", {
+		expect(response.status).toBe(400);
+	});
+
+	test("39. Create Agent Response - nonexistent agent", async () => {
+		const response = await client.post("/agent/responses", {
 			agent_id: missingAgentId,
 			message: "What can you help me with?",
-		}),
-	);
+		});
 
-	if (process.exitCode === undefined) {
-		process.stdout.write("All tests passed\n");
-	} else {
-		process.stdout.write("Some tests failed\n");
-	}
-}
-
-await runAgentApiRequests();
-sqlite.close();
+		expect(response.status).toBe(404);
+	});
+});
