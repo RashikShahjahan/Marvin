@@ -29,7 +29,7 @@ Set `MARVIN_API_URL` to the API server before running CLI commands.
 export MARVIN_API_URL=http://localhost:3000
 bun run cli agents list
 bun run cli agents get ag_123
-bun run cli agents create --name "Support Agent" --instructions "Be helpful." --model gpt-4.1 --tool read
+bun run cli agents create --name "Support Agent" --instructions "Be helpful." --model gpt-5.4-mini --tool read
 bun run cli agents update ag_123 --name "Updated Agent"
 bun run cli agents delete ag_123
 bun run cli responses create --agent-id ag_123 --message "Hello"
