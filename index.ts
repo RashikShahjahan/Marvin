@@ -1,15 +1,19 @@
 import { randomUUID } from "node:crypto";
 import express, { type Express, type Request, type Response } from "express";
 import { z } from "zod";
-import { createAgentResponse } from "./agent.ts";
+import { createAgentResponse, parseAgentMessages } from "./agent.ts";
 import {
 	createAgent,
+	createConversation,
 	deleteAgent,
 	getAgent,
+	getConversation,
 	listAgents,
 	updateAgent,
+	updateConversationMessages,
 	type AgentRow,
 	type AgentUpdate,
+	type ConversationRow,
 } from "./db.ts";
 
 const app: Express = express();
@@ -40,6 +44,7 @@ const updateAgentSchema = z
 const createAgentResponseSchema = z
 	.object({
 		agent_id: z.string().min(1),
+		conversation_id: z.string().min(1).optional(),
 		message: z.string().min(1),
 	})
 	.strict();
@@ -81,6 +86,18 @@ function toAgentResponse(agent: AgentRow): AgentResponse {
 	};
 }
 
+function createEmptyConversation(agentId: string): ConversationRow {
+	const now = new Date().toISOString();
+
+	return createConversation({
+		id: `conv_${randomUUID()}`,
+		agentId,
+		messages: JSON.stringify([]),
+		createdAt: now,
+		updatedAt: now,
+	});
+}
+
 app.post("/agents", (request: Request, response: Response) => {
 	const parseResult = createAgentSchema.safeParse(request.body);
 
@@ -108,7 +125,10 @@ app.get("/agents", (_request: Request, response: Response) => {
 	});
 });
 
-app.post("/agent/responses", async (request: Request, response: Response) => {
+async function createAgentResponseHandler(
+	request: Request,
+	response: Response,
+): Promise<void> {
 	const parseResult = createAgentResponseSchema.safeParse(request.body);
 
 	if (!parseResult.success) {
@@ -132,16 +152,44 @@ app.post("/agent/responses", async (request: Request, response: Response) => {
 		return;
 	}
 
-	const message = await createAgentResponse(
+	const conversation =
+		parseResult.data.conversation_id === undefined
+			? createEmptyConversation(agent.id)
+			: getConversation(parseResult.data.conversation_id);
+
+	if (conversation === undefined || conversation.agentId !== agent.id) {
+		response.sendStatus(404);
+		return;
+	}
+
+	const messages = parseAgentMessages(conversation.messages);
+
+	if (messages === undefined) {
+		response.sendStatus(400);
+		return;
+	}
+
+	const result = await createAgentResponse(
 		agent.instructions,
 		parseResult.data.message,
 		tools,
+		messages,
+	);
+
+	updateConversationMessages(
+		conversation.id,
+		JSON.stringify(result.messages),
+		new Date().toISOString(),
 	);
 
 	response.json({
-		message,
+		message: result.message,
+		conversation_id: conversation.id,
 	});
-});
+}
+
+app.post("/responses", createAgentResponseHandler);
+app.post("/agent/responses", createAgentResponseHandler);
 
 app.get("/agents/:id", (request: Request, response: Response) => {
 	const params = agentParamsSchema.parse(request.params);

@@ -20,6 +20,16 @@ sqlite.run(`
 	)
 `);
 
+sqlite.run(`
+	CREATE TABLE IF NOT EXISTS conversations (
+		id text PRIMARY KEY,
+		agent_id text NOT NULL,
+		messages text NOT NULL,
+		created_at text NOT NULL,
+		updated_at text NOT NULL
+	)
+`);
+
 const database = drizzle({ client: sqlite });
 
 const agentsTable = sqliteTable("agents", {
@@ -31,8 +41,18 @@ const agentsTable = sqliteTable("agents", {
 	tools: text("tools"),
 });
 
+const conversationsTable = sqliteTable("conversations", {
+	id: text("id").primaryKey(),
+	agentId: text("agent_id").notNull(),
+	messages: text("messages").notNull(),
+	createdAt: text("created_at").notNull(),
+	updatedAt: text("updated_at").notNull(),
+});
+
 export type AgentRow = typeof agentsTable.$inferSelect;
 export type NewAgentRow = AgentRow;
+export type ConversationRow = typeof conversationsTable.$inferSelect;
+export type NewConversationRow = ConversationRow;
 
 export type AgentUpdate = {
 	name?: string;
@@ -51,6 +71,13 @@ export function createAgent(agent: NewAgentRow): AgentRow {
 	return agent;
 }
 
+export function createConversation(
+	conversation: NewConversationRow,
+): ConversationRow {
+	database.insert(conversationsTable).values(conversation).run();
+	return conversation;
+}
+
 export function getAgent(id: string): AgentRow | undefined {
 	return database
 		.select()
@@ -63,6 +90,27 @@ export function listAgents(): AgentRow[] {
 	const agents = database.select().from(agentsTable).all();
 	agents.sort((left, right) => left.id.localeCompare(right.id));
 	return agents;
+}
+
+export function getConversation(id: string): ConversationRow | undefined {
+	return database
+		.select()
+		.from(conversationsTable)
+		.where(eq(conversationsTable.id, id))
+		.get();
+}
+
+export function updateConversationMessages(
+	id: string,
+	messages: string,
+	updatedAt: string,
+): ConversationRow | undefined {
+	database
+		.update(conversationsTable)
+		.set({ messages, updatedAt })
+		.where(eq(conversationsTable.id, id))
+		.run();
+	return getConversation(id);
 }
 
 export function updateAgent(

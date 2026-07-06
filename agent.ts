@@ -119,6 +119,139 @@ type MessageContentBlock =
 	| ThinkingContent
 	| ToolCall;
 
+const textContentSchema = z
+	.object({
+		type: z.literal("text"),
+		text: z.string(),
+		textSignature: z.string().optional(),
+	})
+	.strict();
+const imageContentSchema = z
+	.object({
+		type: z.literal("image"),
+		data: z.string(),
+		mimeType: z.string(),
+	})
+	.strict();
+const thinkingContentSchema = z
+	.object({
+		type: z.literal("thinking"),
+		thinking: z.string(),
+		thinkingSignature: z.string().optional(),
+		redacted: z.boolean().optional(),
+	})
+	.strict();
+const toolCallSchema = z
+	.object({
+		type: z.literal("toolCall"),
+		id: z.string(),
+		name: z.string(),
+		arguments: z.record(z.string(), z.unknown()),
+		thoughtSignature: z.string().optional(),
+	})
+	.strict();
+const diagnosticErrorInfoSchema = z
+	.object({
+		name: z.string().optional(),
+		message: z.string(),
+		stack: z.string().optional(),
+		code: z.union([z.string(), z.number()]).optional(),
+	})
+	.strict();
+const diagnosticSchema = z
+	.object({
+		type: z.string(),
+		timestamp: z.number(),
+		error: diagnosticErrorInfoSchema.optional(),
+		details: z.record(z.string(), z.unknown()).optional(),
+	})
+	.strict();
+const usageSchema = z
+	.object({
+		input: z.number(),
+		output: z.number(),
+		cacheRead: z.number(),
+		cacheWrite: z.number(),
+		cacheWrite1h: z.number().optional(),
+		reasoning: z.number().optional(),
+		totalTokens: z.number(),
+		cost: z
+			.object({
+				input: z.number(),
+				output: z.number(),
+				cacheRead: z.number(),
+				cacheWrite: z.number(),
+				total: z.number(),
+			})
+			.strict(),
+	})
+	.strict();
+const userMessageSchema = z
+	.object({
+		role: z.literal("user"),
+		content: z.union([
+			z.string(),
+			z.array(z.union([textContentSchema, imageContentSchema])),
+		]),
+		timestamp: z.number(),
+	})
+	.strict();
+const assistantMessageSchema = z
+	.object({
+		role: z.literal("assistant"),
+		content: z.array(
+			z.union([textContentSchema, thinkingContentSchema, toolCallSchema]),
+		),
+		api: z.string(),
+		provider: z.string(),
+		model: z.string(),
+		responseModel: z.string().optional(),
+		responseId: z.string().optional(),
+		diagnostics: z.array(diagnosticSchema).optional(),
+		usage: usageSchema,
+		stopReason: z.enum(["stop", "length", "toolUse", "error", "aborted"]),
+		errorMessage: z.string().optional(),
+		timestamp: z.number(),
+	})
+	.strict();
+const toolResultMessageSchema = z
+	.object({
+		role: z.literal("toolResult"),
+		toolCallId: z.string(),
+		toolName: z.string(),
+		content: z.array(z.union([textContentSchema, imageContentSchema])),
+		details: z.unknown().optional(),
+		isError: z.boolean(),
+		timestamp: z.number(),
+	})
+	.strict();
+const agentMessageSchema = z.union([
+	userMessageSchema,
+	assistantMessageSchema,
+	toolResultMessageSchema,
+]);
+const agentMessagesSchema = z.array(agentMessageSchema);
+
+export function parseAgentMessages(
+	messages: string,
+): AgentMessage[] | undefined {
+	let parsedMessages: unknown;
+
+	try {
+		parsedMessages = JSON.parse(messages);
+	} catch {
+		return undefined;
+	}
+
+	const parseResult = agentMessagesSchema.safeParse(parsedMessages);
+
+	if (!parseResult.success) {
+		return undefined;
+	}
+
+	return parseResult.data;
+}
+
 function isAssistantMessage(
 	message: AgentMessage,
 ): message is AssistantMessage {
@@ -139,17 +272,24 @@ function contentText(content: string | MessageContentBlock[]): string {
 		.join("");
 }
 
+export type AgentResponseResult = {
+	message: string;
+	messages: AgentMessage[];
+};
+
 export async function createAgentResponse(
 	instructions: string,
 	message: string,
 	toolNames: string[],
-): Promise<string> {
+	messages: AgentMessage[],
+): Promise<AgentResponseResult> {
 	const agent = new Agent({
 		initialState: {
 			model: defaultModel,
 			thinkingLevel: "medium",
 			tools: responseTools(toolNames),
 			systemPrompt: instructions,
+			messages,
 		},
 		streamFn: (model, context, options) =>
 			models.streamSimple(model, context, options),
@@ -162,5 +302,8 @@ export async function createAgentResponse(
 		throw new Error("expected assistant message");
 	}
 
-	return contentText(assistantMessage.content);
+	return {
+		message: contentText(assistantMessage.content),
+		messages: agent.state.messages,
+	};
 }
