@@ -2,6 +2,12 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core"; // pi-lens-ignore: ast-grep:find-import-file-without-extension
+import {
+	createBashTool,
+	createEditTool,
+	createReadTool,
+	createWriteTool,
+} from "@earendil-works/pi-coding-agent"; // pi-lens-ignore: ast-grep:find-import-file-without-extension
 import type {
 	AssistantMessage,
 	Credential,
@@ -87,6 +93,26 @@ const models = builtinModels({
 	credentials: new PiAuthCredentialStore(),
 });
 
+const responseToolNameSchema = z.enum(["read", "write", "edit", "bash"]);
+const responseToolNamesSchema = z.array(responseToolNameSchema);
+const responseToolCwd = import.meta.dir;
+
+const responseToolRegistry = {
+	read: createReadTool(responseToolCwd),
+	write: createWriteTool(responseToolCwd),
+	edit: createEditTool(responseToolCwd),
+	bash: createBashTool(responseToolCwd),
+};
+
+type ResponseToolName = z.infer<typeof responseToolNameSchema>;
+type ResponseTool = (typeof responseToolRegistry)[ResponseToolName];
+
+function responseTools(toolNames: string[]): ResponseTool[] {
+	return responseToolNamesSchema
+		.parse(toolNames)
+		.map((toolName) => responseToolRegistry[toolName]);
+}
+
 type MessageContentBlock =
 	| TextContent
 	| ImageContent
@@ -116,12 +142,13 @@ function contentText(content: string | MessageContentBlock[]): string {
 export async function createAgentResponse(
 	instructions: string,
 	message: string,
+	toolNames: string[],
 ): Promise<string> {
 	const agent = new Agent({
 		initialState: {
 			model: defaultModel,
 			thinkingLevel: "medium",
-			tools: [],
+			tools: responseTools(toolNames),
 			systemPrompt: instructions,
 		},
 		streamFn: (model, context, options) =>

@@ -13,6 +13,7 @@
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.80.3",
     "@earendil-works/pi-ai": "^0.80.3",
+    "@earendil-works/pi-coding-agent": "^0.80.3",
     "@types/express": "^5.0.6",
     "axios": "^1.18.1",
     "drizzle-orm": "^1.0.0-rc.4",

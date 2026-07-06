@@ -123,9 +123,19 @@ app.post("/agent/responses", async (request: Request, response: Response) => {
 		return;
 	}
 
+	let tools: AgentTool[];
+	try {
+		tools =
+			agent.tools === null ? [] : toolsSchema.parse(JSON.parse(agent.tools));
+	} catch {
+		response.sendStatus(400);
+		return;
+	}
+
 	const message = await createAgentResponse(
 		agent.instructions,
 		parseResult.data.message,
+		tools,
 	);
 
 	response.json({

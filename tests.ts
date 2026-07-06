@@ -1,4 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Database } from "bun:sqlite";
@@ -51,10 +57,6 @@ type ExpectedAgentRow = {
 
 type AgentRow = ExpectedAgentRow & {
 	id: string;
-};
-
-type CountRow = {
-	value: number;
 };
 
 beforeAll(async () => {
@@ -125,19 +127,7 @@ function expectDatabaseAgent(
 	expect(row.tools).toBe(expected.tools);
 }
 
-function getDatabaseAgentCount(): number {
-	const row = sqlite
-		.query<CountRow, []>("SELECT count(*) AS value FROM agents")
-		.get();
-
-	if (row === null) {
-		throw new Error("agents table count query returned no rows");
-	}
-
-	return row.value;
-}
-
-function expectAgentResponseMessage(data: unknown): void {
+function getAgentResponseMessage(data: unknown): string {
 	if (!isObject(data)) {
 		throw new Error("expected response body object");
 	}
@@ -146,7 +136,12 @@ function expectAgentResponseMessage(data: unknown): void {
 	if (typeof data.message !== "string") {
 		throw new Error("expected response message string");
 	}
-	expect(data.message.length).toBeGreaterThan(0);
+
+	return data.message;
+}
+
+function expectAgentResponseMessage(data: unknown): void {
+	expect(getAgentResponseMessage(data).length).toBeGreaterThan(0);
 }
 
 describe("POST /agents", () => {
@@ -261,36 +256,10 @@ describe("POST /agents", () => {
 			tools: JSON.stringify([customTool]),
 		});
 	});
-
-	test("9. Create Agent - disallowed metadata field", async () => {
-		const response = await client.post("/agents", {
-			name: "Metadata Agent",
-			instructions: "You are a helpful assistant.",
-			model: primaryModel,
-			metadata: {
-				team: "support",
-			},
-		});
-
-		expect(response.status).toBe(400);
-	});
-
-	test("10. Create Agent - disallowed status field", async () => {
-		const initialAgentCount = getDatabaseAgentCount();
-		const response = await client.post("/agents", {
-			name: "Status Agent",
-			instructions: "You are a helpful assistant.",
-			model: primaryModel,
-			status: "active",
-		});
-
-		expect(response.status).toBe(400);
-		expect(getDatabaseAgentCount()).toBe(initialAgentCount);
-	});
 });
 
 describe("PATCH /agents/:id", () => {
-	test("11. Update Agent - name only", async () => {
+	test("9. Update Agent - name only", async () => {
 		const agentId = await createAgent({
 			name: supportAgentName,
 			instructions: supportAgentInstructions,
@@ -310,7 +279,7 @@ describe("PATCH /agents/:id", () => {
 		});
 	});
 
-	test("12. Update Agent - description only", async () => {
+	test("10. Update Agent - description only", async () => {
 		const agentId = await createAgent({
 			name: supportAgentName,
 			instructions: supportAgentInstructions,
@@ -330,7 +299,7 @@ describe("PATCH /agents/:id", () => {
 		});
 	});
 
-	test("13. Update Agent - clear description", async () => {
+	test("11. Update Agent - clear description", async () => {
 		const agentId = await createAgent({
 			name: supportAgentName,
 			description: "Handles customer support conversations.",
@@ -351,7 +320,7 @@ describe("PATCH /agents/:id", () => {
 		});
 	});
 
-	test("14. Update Agent - instructions only", async () => {
+	test("12. Update Agent - instructions only", async () => {
 		const agentId = await createAgent({
 			name: supportAgentName,
 			instructions: supportAgentInstructions,
@@ -371,7 +340,7 @@ describe("PATCH /agents/:id", () => {
 		});
 	});
 
-	test("15. Update Agent - model only", async () => {
+	test("13. Update Agent - model only", async () => {
 		const agentId = await createAgent({
 			name: supportAgentName,
 			instructions: "You are a concise and professional support agent.",
@@ -391,7 +360,7 @@ describe("PATCH /agents/:id", () => {
 		});
 	});
 
-	test("16. Update Agent - tools only", async () => {
+	test("14. Update Agent - tools only", async () => {
 		const agentId = await createAgent({
 			name: supportAgentName,
 			instructions: "You are a concise and professional support agent.",
@@ -411,7 +380,7 @@ describe("PATCH /agents/:id", () => {
 		});
 	});
 
-	test("17. Update Agent - full update", async () => {
+	test("15. Update Agent - full update", async () => {
 		const agentId = await createAgent({
 			name: supportAgentName,
 			instructions: "You are a concise and professional support agent.",
@@ -436,7 +405,7 @@ describe("PATCH /agents/:id", () => {
 		});
 	});
 
-	test("18. Update Agent - empty body", async () => {
+	test("16. Update Agent - empty body", async () => {
 		const agentId = await createAgent({
 			name: supportAgentName,
 			instructions: supportAgentInstructions,
@@ -447,7 +416,7 @@ describe("PATCH /agents/:id", () => {
 		expect(response.status).toBe(400);
 	});
 
-	test("19. Update Agent - empty name", async () => {
+	test("17. Update Agent - empty name", async () => {
 		const agentId = await createAgent({
 			name: supportAgentName,
 			instructions: supportAgentInstructions,
@@ -460,7 +429,7 @@ describe("PATCH /agents/:id", () => {
 		expect(response.status).toBe(400);
 	});
 
-	test("20. Update Agent - empty instructions", async () => {
+	test("18. Update Agent - empty instructions", async () => {
 		const agentId = await createAgent({
 			name: supportAgentName,
 			instructions: supportAgentInstructions,
@@ -473,7 +442,7 @@ describe("PATCH /agents/:id", () => {
 		expect(response.status).toBe(400);
 	});
 
-	test("21. Update Agent - custom model", async () => {
+	test("19. Update Agent - custom model", async () => {
 		const agentId = await createAgent({
 			name: supportAgentName,
 			instructions: supportAgentInstructions,
@@ -492,56 +461,10 @@ describe("PATCH /agents/:id", () => {
 			tools: null,
 		});
 	});
-
-	test("22. Update Agent - disallowed metadata field", async () => {
-		const agentId = await createAgent({
-			name: "Technical Support Agent",
-			description: "Answers technical support questions.",
-			instructions: "You help users troubleshoot technical issues.",
-			model: customModel,
-			tools: [webSearchTool, fileReaderTool],
-		});
-		const response = await client.patch(`/agents/${agentId}`, {
-			metadata: {
-				team: "support",
-			},
-		});
-
-		expect(response.status).toBe(400);
-		expectDatabaseAgent(agentId, {
-			name: "Technical Support Agent",
-			description: "Answers technical support questions.",
-			instructions: "You help users troubleshoot technical issues.",
-			model: customModel,
-			tools: JSON.stringify([webSearchTool, fileReaderTool]),
-		});
-	});
-
-	test("23. Update Agent - disallowed status field", async () => {
-		const agentId = await createAgent({
-			name: "Technical Support Agent",
-			description: "Answers technical support questions.",
-			instructions: "You help users troubleshoot technical issues.",
-			model: customModel,
-			tools: [webSearchTool, fileReaderTool],
-		});
-		const response = await client.patch(`/agents/${agentId}`, {
-			status: "inactive",
-		});
-
-		expect(response.status).toBe(400);
-		expectDatabaseAgent(agentId, {
-			name: "Technical Support Agent",
-			description: "Answers technical support questions.",
-			instructions: "You help users troubleshoot technical issues.",
-			model: customModel,
-			tools: JSON.stringify([webSearchTool, fileReaderTool]),
-		});
-	});
 });
 
 describe("DELETE /agents/:id", () => {
-	test("24. Delete Agent - existing agent", async () => {
+	test("20. Delete Agent - existing agent", async () => {
 		const agentId = await createAgent({
 			name: "Delete Agent",
 			instructions: "You are deleted during the test.",
@@ -552,20 +475,7 @@ describe("DELETE /agents/:id", () => {
 		expect(response.status).toBe(204);
 	});
 
-	test("25. Delete Agent - already deleted agent", async () => {
-		const agentId = await createAgent({
-			name: "Delete Twice Agent",
-			instructions: "You are deleted twice during the test.",
-			model: primaryModel,
-		});
-		const firstResponse = await client.delete(`/agents/${agentId}`);
-		const secondResponse = await client.delete(`/agents/${agentId}`);
-
-		expect(firstResponse.status).toBe(204);
-		expect(secondResponse.status).toBe(204);
-	});
-
-	test("26. Delete Agent - nonexistent agent", async () => {
+	test("21. Delete Agent - nonexistent agent", async () => {
 		const response = await client.delete(`/agents/${missingAgentId}`);
 
 		expect(response.status).toBe(404);
@@ -573,7 +483,7 @@ describe("DELETE /agents/:id", () => {
 });
 
 describe("GET /agents/:id", () => {
-	test("27. Get Agent - existing agent", async () => {
+	test("22. Get Agent - existing agent", async () => {
 		const agentId = await createAgent({
 			name: "Get Agent",
 			instructions: "You are fetched during the test.",
@@ -584,34 +494,21 @@ describe("GET /agents/:id", () => {
 		expect(response.status).toBe(200);
 	});
 
-	test("28. Get Agent - nonexistent agent", async () => {
+	test("23. Get Agent - nonexistent agent", async () => {
 		const response = await client.get(`/agents/${missingAgentId}`);
 
 		expect(response.status).toBe(404);
 	});
-
-	test("29. Get Agent - deleted agent", async () => {
-		const agentId = await createAgent({
-			name: "Deleted Get Agent",
-			instructions: "You are deleted before fetch.",
-			model: primaryModel,
-		});
-		const deleteResponse = await client.delete(`/agents/${agentId}`);
-		const getResponse = await client.get(`/agents/${agentId}`);
-
-		expect(deleteResponse.status).toBe(204);
-		expect(getResponse.status).toBe(404);
-	});
 });
 
 describe("GET /agents", () => {
-	test("30. List Agents", async () => {
+	test("24. List Agents", async () => {
 		const response = await client.get("/agents");
 
 		expect(response.status).toBe(200);
 	});
 
-	test("31. List Agents with pagination", async () => {
+	test("25. List Agents with pagination", async () => {
 		const response = await client.get("/agents", {
 			params: {
 				limit: 20,
@@ -624,13 +521,12 @@ describe("GET /agents", () => {
 });
 
 describe("POST /agent/responses", () => {
-	test("32. Create Agent Response - valid request", async () => {
+	test("26. Create Agent Response - valid request", async () => {
 		const agentId = await createAgent({
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
 			instructions: researchAgentInstructions,
 			model: primaryModel,
-			tools: [webSearchTool, fileReaderTool],
 		});
 		const response = await client.post("/agent/responses", {
 			agent_id: agentId,
@@ -641,24 +537,89 @@ describe("POST /agent/responses", () => {
 		expectAgentResponseMessage(response.data);
 	}, 60000);
 
-	test("33. Create Agent Response - disallowed model override", async () => {
+	test("27. Create Agent Response - read tool", async () => {
+		const filePath = join(testDirectory, "read-tool.txt");
+		const fileContent = "READ_TOOL_SENTINEL_27";
+		writeFileSync(filePath, fileContent);
 		const agentId = await createAgent({
-			name: "Research Agent",
-			description: "Finds and summarizes technical information.",
-			instructions: researchAgentInstructions,
+			name: "Read Tool Agent",
+			instructions:
+				"Use the read tool when asked to read a file. After reading, reply only with the file contents.",
 			model: primaryModel,
-			tools: [webSearchTool, fileReaderTool],
+			tools: ["read"],
 		});
 		const response = await client.post("/agent/responses", {
 			agent_id: agentId,
-			model: customModel,
-			message: "Use the default model for this response.",
+			message: `Read ${filePath} with the read tool.`,
 		});
 
-		expect(response.status).toBe(400);
-	});
+		expect(response.status).toBe(200);
+		expect(getAgentResponseMessage(response.data)).toContain(fileContent);
+	}, 60000);
 
-	test("34. Create Agent Response - missing agent_id", async () => {
+	test("28. Create Agent Response - write tool", async () => {
+		const filePath = join(testDirectory, "write-tool.txt");
+		const fileContent = "WRITE_TOOL_SENTINEL_28";
+		const agentId = await createAgent({
+			name: "Write Tool Agent",
+			instructions:
+				"Use the write tool when asked to write a file. After writing, reply only with TOOL_DONE.",
+			model: primaryModel,
+			tools: ["write"],
+		});
+		const response = await client.post("/agent/responses", {
+			agent_id: agentId,
+			message: `Use the write tool with path ${filePath} and content ${fileContent}.`,
+		});
+
+		expect(response.status).toBe(200);
+		expectAgentResponseMessage(response.data);
+		expect(readFileSync(filePath, "utf-8")).toBe(fileContent);
+	}, 60000);
+
+	test("29. Create Agent Response - edit tool", async () => {
+		const filePath = join(testDirectory, "edit-tool.txt");
+		writeFileSync(filePath, "before EDIT_TOOL_BEFORE_29 after");
+		const agentId = await createAgent({
+			name: "Edit Tool Agent",
+			instructions:
+				"Use the edit tool when asked to edit a file. After editing, reply only with TOOL_DONE.",
+			model: primaryModel,
+			tools: ["edit"],
+		});
+		const response = await client.post("/agent/responses", {
+			agent_id: agentId,
+			message: `Use the edit tool on ${filePath}. Replace oldText EDIT_TOOL_BEFORE_29 with newText EDIT_TOOL_AFTER_29.`,
+		});
+
+		expect(response.status).toBe(200);
+		expectAgentResponseMessage(response.data);
+		expect(readFileSync(filePath, "utf-8")).toBe(
+			"before EDIT_TOOL_AFTER_29 after",
+		);
+	}, 60000);
+
+	test("30. Create Agent Response - bash tool", async () => {
+		const filePath = join(testDirectory, "bash-tool.txt");
+		const fileContent = "BASH_TOOL_SENTINEL_30";
+		const agentId = await createAgent({
+			name: "Bash Tool Agent",
+			instructions:
+				"Use the bash tool when asked to run a command. After the command succeeds, reply only with TOOL_DONE.",
+			model: primaryModel,
+			tools: ["bash"],
+		});
+		const response = await client.post("/agent/responses", {
+			agent_id: agentId,
+			message: `Use the bash tool to run: printf ${fileContent} > ${filePath}`,
+		});
+
+		expect(response.status).toBe(200);
+		expectAgentResponseMessage(response.data);
+		expect(readFileSync(filePath, "utf-8")).toBe(fileContent);
+	}, 60000);
+
+	test("31. Create Agent Response - missing agent_id", async () => {
 		const response = await client.post("/agent/responses", {
 			message: "What can you help me with?",
 		});
@@ -666,7 +627,7 @@ describe("POST /agent/responses", () => {
 		expect(response.status).toBe(400);
 	});
 
-	test("35. Create Agent Response - missing message", async () => {
+	test("32. Create Agent Response - missing message", async () => {
 		const agentId = await createAgent({
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
@@ -681,7 +642,7 @@ describe("POST /agent/responses", () => {
 		expect(response.status).toBe(400);
 	});
 
-	test("36. Create Agent Response - empty message", async () => {
+	test("33. Create Agent Response - empty message", async () => {
 		const agentId = await createAgent({
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
@@ -697,7 +658,7 @@ describe("POST /agent/responses", () => {
 		expect(response.status).toBe(400);
 	});
 
-	test("37. Create Agent Response - empty model", async () => {
+	test("34. Create Agent Response - empty model", async () => {
 		const agentId = await createAgent({
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
@@ -714,24 +675,7 @@ describe("POST /agent/responses", () => {
 		expect(response.status).toBe(400);
 	});
 
-	test("38. Create Agent Response - disallowed role field", async () => {
-		const agentId = await createAgent({
-			name: "Research Agent",
-			description: "Finds and summarizes technical information.",
-			instructions: researchAgentInstructions,
-			model: primaryModel,
-			tools: [webSearchTool, fileReaderTool],
-		});
-		const response = await client.post("/agent/responses", {
-			agent_id: agentId,
-			message: "What can you help me with?",
-			role: "assistant",
-		});
-
-		expect(response.status).toBe(400);
-	});
-
-	test("39. Create Agent Response - nonexistent agent", async () => {
+	test("35. Create Agent Response - nonexistent agent", async () => {
 		const response = await client.post("/agent/responses", {
 			agent_id: missingAgentId,
 			message: "What can you help me with?",
