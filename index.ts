@@ -166,6 +166,4 @@ app.delete("/agents/:id", (request: Request, response: Response) => {
 	response.sendStatus(204);
 });
 
-app.listen(port, () => {
-	console.log(`Listening on port ${port}`);
-});
+app.listen(port);

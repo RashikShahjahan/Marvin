@@ -1,11 +1,18 @@
 import { Database } from "bun:sqlite";
 import axios, { type AxiosResponse } from "axios";
 import { count, eq } from "drizzle-orm";
+// pi-lens-ignore: ast-grep:find-import-file-without-extension
 import { drizzle } from "drizzle-orm/bun-sqlite";
+// pi-lens-ignore: ast-grep:find-import-file-without-extension
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 
+const defaultApiProtocol = "http";
+const defaultApiHost = "localhost";
+const defaultApiPort = "3000";
+const defaultApiBaseUrl = `${defaultApiProtocol}://${defaultApiHost}:${defaultApiPort}`;
+
 const client = axios.create({
-	baseURL: process.env.AGENTS_API_BASE_URL ?? "http://localhost:3000",
+	baseURL: process.env.AGENTS_API_BASE_URL ?? defaultApiBaseUrl,
 	validateStatus: () => true,
 });
 

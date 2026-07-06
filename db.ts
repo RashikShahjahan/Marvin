@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
 import { eq } from "drizzle-orm";
+// pi-lens-ignore: ast-grep:find-import-file-without-extension
 import { drizzle } from "drizzle-orm/bun-sqlite";
+// pi-lens-ignore: ast-grep:find-import-file-without-extension
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 const databasePath = process.env.AGENTS_DB_PATH ?? "agents.sqlite";
@@ -58,7 +60,9 @@ export function getAgent(id: string): AgentRow | undefined {
 }
 
 export function listAgents(): AgentRow[] {
-	return database.select().from(agentsTable).all();
+	const agents = database.select().from(agentsTable).all();
+	agents.sort((left, right) => left.id.localeCompare(right.id));
+	return agents;
 }
 
 export function updateAgent(
