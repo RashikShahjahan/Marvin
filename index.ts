@@ -1,17 +1,12 @@
-import { Agent } from "@earendil-works/pi-agent-core";
-import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
+import express, { type Express, type Request, type Response } from 'express';
 
-const model = getBuiltinModel("openai-codex", "gpt-5.5");
+const app: Express = express();
+const port = 3000;
 
-new Agent({
-	initialState: {
-		model,
-		thinkingLevel: "medium",
-		tools: [],
-		systemPrompt: 
-			"You are Marvin, a helpful AI assistant.",
-	},
+app.get('/health', (req: Request, res: Response) => {
+  res.send(200);
 });
 
-
-
+app.listen(port, () => {
+  console.log(`Listening on port ${port}`);
+});
