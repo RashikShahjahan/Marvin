@@ -5,7 +5,7 @@ import { drizzle } from "drizzle-orm/bun-sqlite";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 const client = axios.create({
-	baseURL: process.env.AGENTS_API_BASE_URL,
+	baseURL: process.env.AGENTS_API_BASE_URL ?? "http://localhost:3000",
 	validateStatus: () => true,
 });
 
@@ -29,11 +29,7 @@ type ExpectedAgentRow = {
 	tools: string | null;
 };
 
-const databasePath = process.env.AGENTS_DB_PATH;
-
-if (databasePath === undefined) {
-	throw new Error("AGENTS_DB_PATH must be set");
-}
+const databasePath = process.env.AGENTS_DB_PATH ?? "agents.sqlite";
 
 const sqlite = new Database(databasePath, {
 	readonly: true,

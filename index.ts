@@ -1,37 +1,78 @@
+import { randomUUID } from "node:crypto";
 import express, { type Express, type Request, type Response } from "express";
 import { z } from "zod";
+import {
+	createAgent,
+	deleteAgent,
+	getAgent,
+	listAgents,
+	updateAgent,
+	type AgentRow,
+	type AgentUpdate,
+} from "./db.ts";
 
 const app: Express = express();
 const port = 3000;
 
 const modelSchema = z.enum(["gpt-4.1", "gpt-4.1-mini"]);
 const toolSchema = z.enum(["web_search", "file_reader"]);
+const toolsSchema = z.array(toolSchema);
 const createAgentSchema = z
 	.object({
 		name: z.string().min(1),
 		description: z.string().optional(),
 		instructions: z.string().min(1),
 		model: modelSchema,
-		tools: z.array(toolSchema).optional(),
+		tools: toolsSchema.optional(),
 	})
 	.strict();
+const updateAgentSchema = z
+	.object({
+		name: z.string().min(1).optional(),
+		description: z.string().nullable().optional(),
+		instructions: z.string().min(1).optional(),
+		model: modelSchema.optional(),
+		tools: toolsSchema.optional(),
+	})
+	.strict()
+	.refine((agent) => Object.keys(agent).length > 0);
+
+const agentParamsSchema = z.object({
+	id: z.string(),
+});
 
 type AgentModel = z.infer<typeof modelSchema>;
 type AgentTool = z.infer<typeof toolSchema>;
 
-type AgentRecord = {
+type AgentResponse = {
 	id: string;
 	name: string;
-	description?: string;
+	description: string | null;
 	instructions: string;
 	model: AgentModel;
-	tools?: AgentTool[];
+	tools: string | null;
 };
 
-const agents = new Map<string, AgentRecord>();
-let nextAgentNumber = 1;
-
 app.use(express.json());
+
+function storedTools(tools: AgentTool[] | undefined): string | null {
+	if (tools === undefined) {
+		return null;
+	}
+
+	return JSON.stringify(tools);
+}
+
+function toAgentResponse(agent: AgentRow): AgentResponse {
+	return {
+		id: agent.id,
+		name: agent.name,
+		description: agent.description,
+		instructions: agent.instructions,
+		model: modelSchema.parse(agent.model),
+		tools: agent.tools,
+	};
+}
 
 app.post("/agents", (request: Request, response: Response) => {
 	const parseResult = createAgentSchema.safeParse(request.body);
@@ -41,16 +82,88 @@ app.post("/agents", (request: Request, response: Response) => {
 		return;
 	}
 
-	const id = `ag_${nextAgentNumber}`;
-	nextAgentNumber += 1;
+	const agent = createAgent({
+		id: `ag_${randomUUID()}`,
+		name: parseResult.data.name,
+		description: parseResult.data.description ?? null,
+		instructions: parseResult.data.instructions,
+		model: parseResult.data.model,
+		tools: storedTools(parseResult.data.tools),
+	});
 
-	const agent: AgentRecord = {
-		id,
-		...parseResult.data,
-	};
+	response.status(201).json(toAgentResponse(agent));
+});
 
-	agents.set(id, agent);
-	response.status(201).json(agent);
+app.get("/agents", (_request: Request, response: Response) => {
+	response.json({
+		data: listAgents().map(toAgentResponse),
+		next_cursor: null,
+	});
+});
+
+app.get("/agents/:id", (request: Request, response: Response) => {
+	const params = agentParamsSchema.parse(request.params);
+	const agent = getAgent(params.id);
+
+	if (agent === undefined) {
+		response.sendStatus(404);
+		return;
+	}
+
+	response.json(toAgentResponse(agent));
+});
+
+app.patch("/agents/:id", (request: Request, response: Response) => {
+	const params = agentParamsSchema.parse(request.params);
+	const parseResult = updateAgentSchema.safeParse(request.body);
+
+	if (!parseResult.success) {
+		response.sendStatus(400);
+		return;
+	}
+
+	const changes: AgentUpdate = {};
+
+	if (parseResult.data.name !== undefined) {
+		changes.name = parseResult.data.name;
+	}
+
+	if (parseResult.data.description !== undefined) {
+		changes.description = parseResult.data.description;
+	}
+
+	if (parseResult.data.instructions !== undefined) {
+		changes.instructions = parseResult.data.instructions;
+	}
+
+	if (parseResult.data.model !== undefined) {
+		changes.model = parseResult.data.model;
+	}
+
+	if (parseResult.data.tools !== undefined) {
+		changes.tools = storedTools(parseResult.data.tools);
+	}
+
+	const agent = updateAgent(params.id, changes);
+
+	if (agent === undefined) {
+		response.sendStatus(404);
+		return;
+	}
+
+	response.json(toAgentResponse(agent));
+});
+
+app.delete("/agents/:id", (request: Request, response: Response) => {
+	const params = agentParamsSchema.parse(request.params);
+	const deleteResult = deleteAgent(params.id);
+
+	if (deleteResult === "missing") {
+		response.sendStatus(404);
+		return;
+	}
+
+	response.sendStatus(204);
 });
 
 app.listen(port, () => {
