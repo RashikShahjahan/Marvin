@@ -1,9 +1,55 @@
+import { Database } from "bun:sqlite";
 import axios, { type AxiosResponse } from "axios";
+import { count, eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 const client = axios.create({
 	baseURL: process.env.AGENTS_API_BASE_URL,
 	validateStatus: () => true,
 });
+
+const primaryModel = "gpt-4.1";
+const miniModel = "gpt-4.1-mini";
+
+const agentsTable = sqliteTable("agents", {
+	id: text("id").primaryKey(),
+	name: text("name").notNull(),
+	description: text("description"),
+	instructions: text("instructions").notNull(),
+	model: text("model").notNull(),
+	tools: text("tools"),
+});
+
+type ExpectedAgentRow = {
+	name: string;
+	description: string | null;
+	instructions: string;
+	model: string;
+	tools: string | null;
+};
+
+const databasePath = process.env.AGENTS_DB_PATH;
+
+if (databasePath === undefined) {
+	throw new Error("AGENTS_DB_PATH must be set");
+}
+
+const sqlite = new Database(databasePath, {
+	readonly: true,
+	create: false,
+});
+const database = drizzle({ client: sqlite });
+const initialAgentCountRow = database
+	.select({ value: count() })
+	.from(agentsTable)
+	.get();
+
+if (initialAgentCountRow === undefined) {
+	throw new Error("agents table count query returned no rows");
+}
+
+const initialAgentCount = initialAgentCountRow.value;
 
 type TestResponse = AxiosResponse<unknown> | undefined;
 
@@ -74,6 +120,63 @@ function getAgentId(label: string, data: unknown): string | undefined {
 	return undefined;
 }
 
+function expectEqual(label: string, actual: unknown, expected: unknown): void {
+	const passed = actual === expected;
+	const result = passed ? "PASS" : "FAIL";
+
+	process.stdout.write(
+		`${result} ${label} expected ${JSON.stringify(expected)} got ${JSON.stringify(actual)}\n`,
+	);
+
+	if (!passed) {
+		process.exitCode = 1;
+	}
+}
+
+function expectDatabaseAgent(
+	label: string,
+	agentId: string | undefined,
+	expected: ExpectedAgentRow,
+): void {
+	if (agentId === undefined) {
+		process.stdout.write(`${"SKIP"} ${label} missing agent id\n`);
+		process.exitCode = 1;
+		return;
+	}
+
+	const row = database
+		.select()
+		.from(agentsTable)
+		.where(eq(agentsTable.id, agentId))
+		.get();
+
+	if (row === undefined) {
+		process.stdout.write(`${"FAIL"} ${label} expected database agent row\n`);
+		process.exitCode = 1;
+		return;
+	}
+
+	expectEqual(`${label} database id`, row.id, agentId);
+	expectEqual(`${label} database name`, row.name, expected.name);
+	expectEqual(
+		`${label} database description`,
+		row.description,
+		expected.description,
+	);
+	expectEqual(
+		`${label} database instructions`,
+		row.instructions,
+		expected.instructions,
+	);
+	expectEqual(`${label} database model`, row.model, expected.model);
+	expectEqual(`${label} database tools`, row.tools, expected.tools);
+}
+
+function expectDatabaseAgentCount(label: string, expectedCount: number): void {
+	const row = database.select({ value: count() }).from(agentsTable).get();
+	expectEqual(`${label} database agent count`, row?.value, expectedCount);
+}
+
 async function runAgentApiRequests(): Promise<void> {
 	const missingAgentId = "ag_missing";
 
@@ -83,13 +186,20 @@ async function runAgentApiRequests(): Promise<void> {
 		client.post("/agents", {
 			name: "Support Agent",
 			instructions: "You are a helpful customer support agent.",
-			model: "gpt-4.1",
+			model: primaryModel,
 		}),
 	);
 	const agentId = getAgentId(
 		"1. Create Agent - valid minimal request",
 		createMinimalResponse?.data,
 	);
+	expectDatabaseAgent("1. Create Agent - valid minimal request", agentId, {
+		name: "Support Agent",
+		description: null,
+		instructions: "You are a helpful customer support agent.",
+		model: primaryModel,
+		tools: null,
+	});
 
 	const createFullResponse = await expectStatus(
 		"2. Create Agent - valid full request",
@@ -98,7 +208,7 @@ async function runAgentApiRequests(): Promise<void> {
 			name: "Research Agent",
 			description: "Finds and summarizes technical information.",
 			instructions: "You research topics and provide concise summaries.",
-			model: "gpt-4.1",
+			model: primaryModel,
 			tools: ["web_search", "file_reader"],
 		}),
 	);
@@ -106,13 +216,20 @@ async function runAgentApiRequests(): Promise<void> {
 		"2. Create Agent - valid full request",
 		createFullResponse?.data,
 	);
+	expectDatabaseAgent("2. Create Agent - valid full request", existingAgentId, {
+		name: "Research Agent",
+		description: "Finds and summarizes technical information.",
+		instructions: "You research topics and provide concise summaries.",
+		model: primaryModel,
+		tools: JSON.stringify(["web_search", "file_reader"]),
+	});
 
 	await expectStatus(
 		"3. Create Agent - missing name",
 		400,
 		client.post("/agents", {
 			instructions: "You are a helpful assistant.",
-			model: "gpt-4.1",
+			model: primaryModel,
 		}),
 	);
 
@@ -121,7 +238,7 @@ async function runAgentApiRequests(): Promise<void> {
 		400,
 		client.post("/agents", {
 			name: "Broken Agent",
-			model: "gpt-4.1",
+			model: primaryModel,
 		}),
 	);
 
@@ -140,7 +257,7 @@ async function runAgentApiRequests(): Promise<void> {
 		client.post("/agents", {
 			name: "",
 			instructions: "You are a helpful assistant.",
-			model: "gpt-4.1",
+			model: primaryModel,
 		}),
 	);
 
@@ -160,7 +277,7 @@ async function runAgentApiRequests(): Promise<void> {
 		client.post("/agents", {
 			name: "Tool Agent",
 			instructions: "You use tools when needed.",
-			model: "gpt-4.1",
+			model: primaryModel,
 			tools: ["unsupported_tool"],
 		}),
 	);
@@ -171,7 +288,7 @@ async function runAgentApiRequests(): Promise<void> {
 		client.post("/agents", {
 			name: "Metadata Agent",
 			instructions: "You are a helpful assistant.",
-			model: "gpt-4.1",
+			model: primaryModel,
 			metadata: {
 				team: "support",
 			},
@@ -184,9 +301,13 @@ async function runAgentApiRequests(): Promise<void> {
 		client.post("/agents", {
 			name: "Status Agent",
 			instructions: "You are a helpful assistant.",
-			model: "gpt-4.1",
+			model: primaryModel,
 			status: "active",
 		}),
+	);
+	expectDatabaseAgentCount(
+		"10. Create Agent - invalid create requests",
+		initialAgentCount + 2,
 	);
 
 	await expectStatusForAgent(
@@ -198,6 +319,13 @@ async function runAgentApiRequests(): Promise<void> {
 				name: "Updated Support Agent",
 			}),
 	);
+	expectDatabaseAgent("11. Update Agent - name only", agentId, {
+		name: "Updated Support Agent",
+		description: null,
+		instructions: "You are a helpful customer support agent.",
+		model: primaryModel,
+		tools: null,
+	});
 
 	await expectStatusForAgent(
 		"12. Update Agent - description only",
@@ -208,6 +336,13 @@ async function runAgentApiRequests(): Promise<void> {
 				description: "Handles customer support conversations.",
 			}),
 	);
+	expectDatabaseAgent("12. Update Agent - description only", agentId, {
+		name: "Updated Support Agent",
+		description: "Handles customer support conversations.",
+		instructions: "You are a helpful customer support agent.",
+		model: primaryModel,
+		tools: null,
+	});
 
 	await expectStatusForAgent(
 		"13. Update Agent - clear description",
@@ -218,6 +353,13 @@ async function runAgentApiRequests(): Promise<void> {
 				description: null,
 			}),
 	);
+	expectDatabaseAgent("13. Update Agent - clear description", agentId, {
+		name: "Updated Support Agent",
+		description: null,
+		instructions: "You are a helpful customer support agent.",
+		model: primaryModel,
+		tools: null,
+	});
 
 	await expectStatusForAgent(
 		"14. Update Agent - instructions only",
@@ -228,6 +370,13 @@ async function runAgentApiRequests(): Promise<void> {
 				instructions: "You are a concise and professional support agent.",
 			}),
 	);
+	expectDatabaseAgent("14. Update Agent - instructions only", agentId, {
+		name: "Updated Support Agent",
+		description: null,
+		instructions: "You are a concise and professional support agent.",
+		model: primaryModel,
+		tools: null,
+	});
 
 	await expectStatusForAgent(
 		"15. Update Agent - model only",
@@ -235,9 +384,16 @@ async function runAgentApiRequests(): Promise<void> {
 		agentId,
 		(id) =>
 			client.patch(`/agents/${id}`, {
-				model: "gpt-4.1-mini",
+				model: miniModel,
 			}),
 	);
+	expectDatabaseAgent("15. Update Agent - model only", agentId, {
+		name: "Updated Support Agent",
+		description: null,
+		instructions: "You are a concise and professional support agent.",
+		model: miniModel,
+		tools: null,
+	});
 
 	await expectStatusForAgent(
 		"16. Update Agent - tools only",
@@ -248,6 +404,13 @@ async function runAgentApiRequests(): Promise<void> {
 				tools: ["web_search"],
 			}),
 	);
+	expectDatabaseAgent("16. Update Agent - tools only", agentId, {
+		name: "Updated Support Agent",
+		description: null,
+		instructions: "You are a concise and professional support agent.",
+		model: miniModel,
+		tools: JSON.stringify(["web_search"]),
+	});
 
 	await expectStatusForAgent(
 		"17. Update Agent - full update",
@@ -258,10 +421,17 @@ async function runAgentApiRequests(): Promise<void> {
 				name: "Technical Support Agent",
 				description: "Answers technical support questions.",
 				instructions: "You help users troubleshoot technical issues.",
-				model: "gpt-4.1",
+				model: primaryModel,
 				tools: ["web_search", "file_reader"],
 			}),
 	);
+	expectDatabaseAgent("17. Update Agent - full update", agentId, {
+		name: "Technical Support Agent",
+		description: "Answers technical support questions.",
+		instructions: "You help users troubleshoot technical issues.",
+		model: primaryModel,
+		tools: JSON.stringify(["web_search", "file_reader"]),
+	});
 
 	await expectStatusForAgent(
 		"18. Update Agent - empty body",
@@ -321,6 +491,13 @@ async function runAgentApiRequests(): Promise<void> {
 				status: "inactive",
 			}),
 	);
+	expectDatabaseAgent("23. Update Agent - invalid update requests", agentId, {
+		name: "Technical Support Agent",
+		description: "Answers technical support questions.",
+		instructions: "You help users troubleshoot technical issues.",
+		model: primaryModel,
+		tools: JSON.stringify(["web_search", "file_reader"]),
+	});
 
 	await expectStatusForAgent(
 		"24. Delete Agent - existing agent",
@@ -383,3 +560,4 @@ async function runAgentApiRequests(): Promise<void> {
 }
 
 await runAgentApiRequests();
+sqlite.close();
