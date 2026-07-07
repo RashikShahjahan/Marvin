@@ -3,6 +3,8 @@ import {
 	createMarvinResponseClient,
 	handleDiscordMessage,
 	parseDiscordChannelAgents,
+	writeDiscordLog,
+	type DiscordLogEntry,
 	type DiscordMessage,
 	type DiscordThreadConversation,
 	type MarvinFetch,
@@ -72,7 +74,29 @@ describe("Discord adapter", () => {
 			},
 		]);
 	});
+});
 
+test("writes Discord logs as JSON lines", () => {
+	const writes: string[] = [];
+	const originalWrite = process.stdout.write;
+	process.stdout.write = (chunk: string | Uint8Array): boolean => {
+		writes.push(chunk.toString());
+		return true;
+	};
+
+	writeDiscordLog({
+		type: "discord.bot.start",
+		configured_channels: 1,
+	});
+
+	process.stdout.write = originalWrite;
+
+	expect(writes).toEqual([
+		'{"type":"discord.bot.start","configured_channels":1}\n',
+	]);
+});
+
+describe("Discord adapter", () => {
 	test("parses channel-to-agent configuration", () => {
 		expect(
 			Array.from(
@@ -89,6 +113,7 @@ describe("Discord adapter", () => {
 	test("creates a Marvin conversation for the first message in a Discord thread", async () => {
 		const requests: MarvinResponseRequest[] = [];
 		const conversations = new Map<string, StoredThreadConversation>();
+		const logs: DiscordLogEntry[] = [];
 		const action = await handleDiscordMessage(
 			threadMessage("Need billing help"),
 			{
@@ -103,6 +128,9 @@ describe("Discord adapter", () => {
 						message: "I can help with billing.",
 						conversation_id: supportConversationId,
 					};
+				},
+				log: (entry) => {
+					logs.push(entry);
 				},
 			},
 		);
@@ -123,6 +151,28 @@ describe("Discord adapter", () => {
 			type: "reply",
 			content: "I can help with billing.",
 		});
+		expect(logs).toEqual([
+			{
+				type: "discord.message.received",
+				message_id: "message_1",
+				channel_id: supportThreadId,
+				parent_channel_id: supportChannelId,
+			},
+			{
+				type: "discord.response.request",
+				message_id: "message_1",
+				thread_id: supportThreadId,
+				agent_id: supportAgentId,
+				conversation: "new",
+			},
+			{
+				type: "discord.message.reply",
+				message_id: "message_1",
+				thread_id: supportThreadId,
+				agent_id: supportAgentId,
+				conversation_id: supportConversationId,
+			},
+		]);
 	});
 
 	test("continues the stored Marvin conversation for later messages in the same Discord thread", async () => {
@@ -153,6 +203,7 @@ describe("Discord adapter", () => {
 						conversation_id: supportConversationId,
 					};
 				},
+				log: () => {},
 			},
 		);
 
@@ -171,6 +222,7 @@ describe("Discord adapter", () => {
 
 	test("ignores parent-channel messages because conversations are thread-scoped", async () => {
 		const requests: MarvinResponseRequest[] = [];
+		const logs: DiscordLogEntry[] = [];
 		const action = await handleDiscordMessage(
 			{
 				id: "message_2",
@@ -190,10 +242,27 @@ describe("Discord adapter", () => {
 						conversation_id: "conv_unused",
 					};
 				},
+				log: (entry) => {
+					logs.push(entry);
+				},
 			},
 		);
 
 		expect(requests).toEqual([]);
 		expect(action).toEqual({ type: "ignore" });
+		expect(logs).toEqual([
+			{
+				type: "discord.message.received",
+				message_id: "message_2",
+				channel_id: supportChannelId,
+				parent_channel_id: null,
+			},
+			{
+				type: "discord.message.ignore",
+				reason: "not_thread",
+				message_id: "message_2",
+				channel_id: supportChannelId,
+			},
+		]);
 	});
 });

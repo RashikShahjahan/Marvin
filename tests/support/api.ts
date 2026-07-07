@@ -7,10 +7,9 @@ import axios, { type AxiosInstance } from "axios";
 
 const defaultApiProtocol = "http";
 const defaultApiHost = "localhost";
-const defaultApiPort = "3000";
-const defaultApiBaseUrl = `${defaultApiProtocol}://${defaultApiHost}:${defaultApiPort}`;
 
 const projectRoot = join(import.meta.dir, "../..");
+let nextApiPort = 3100;
 
 export const primaryModel = "gpt-4.1";
 export const miniModel = "gpt-4.1-mini";
@@ -87,19 +86,32 @@ function createTestDatabase(testDirectoryPrefix: string): TestDatabase {
 	};
 }
 
-function createApiClient(): AxiosInstance {
+function createApiPort(): string {
+	nextApiPort += 1;
+	return `${nextApiPort}`;
+}
+
+function createApiBaseUrl(apiPort: string): string {
+	return `${defaultApiProtocol}://${defaultApiHost}:${apiPort}`;
+}
+
+function createApiClient(apiPort: string): AxiosInstance {
 	return axios.create({
-		baseURL: defaultApiBaseUrl,
+		baseURL: createApiBaseUrl(apiPort),
 		validateStatus: () => true,
 	});
 }
 
-function startApiServer(databasePath: string): ReturnType<typeof Bun.spawn> {
+function startApiServer(
+	databasePath: string,
+	apiPort: string,
+): Bun.ReadableSubprocess {
 	return Bun.spawn(["bun", "index.ts"], {
 		cwd: projectRoot,
 		env: {
 			...process.env,
 			AGENTS_DB_PATH: databasePath,
+			PORT: apiPort,
 		},
 		stdout: "pipe",
 		stderr: "pipe",
@@ -152,14 +164,19 @@ function createDatabaseAgentExpectation(getSqlite: () => Database) {
 export function createApiTestContext(testDirectoryPrefix: string) {
 	const { databasePath, testDirectory } =
 		createTestDatabase(testDirectoryPrefix);
-	const client = createApiClient();
+	const apiPort = createApiPort();
+	const client = createApiClient(apiPort);
+	const outputDecoder = new TextDecoder();
+	let serverOutput = "";
 
-	let serverProcess: ReturnType<typeof Bun.spawn>;
+	let serverProcess: Bun.ReadableSubprocess;
+	let serverOutputIterator: AsyncIterator<Uint8Array<ArrayBuffer>>;
 	let sqlite: Database;
 
 	beforeAll(async () => {
 		mkdirSync(testDirectory, { recursive: true });
-		serverProcess = startApiServer(databasePath);
+		serverProcess = startApiServer(databasePath, apiPort);
+		serverOutputIterator = serverProcess.stdout[Symbol.asyncIterator]();
 		await Bun.sleep(500);
 		sqlite = openTestDatabase(databasePath);
 	});
@@ -170,10 +187,25 @@ export function createApiTestContext(testDirectoryPrefix: string) {
 		rmSync(testDirectory, { recursive: true, force: true });
 	});
 
+	async function readServerOutputUntil(text: string): Promise<string> {
+		while (!serverOutput.includes(text)) {
+			const readResult = await serverOutputIterator.next();
+
+			if (readResult.done) {
+				throw new Error("expected server output");
+			}
+
+			serverOutput += outputDecoder.decode(readResult.value, { stream: true });
+		}
+
+		return serverOutput;
+	}
+
 	return {
 		client,
 		createAgent: createAgentFactory(client),
 		expectDatabaseAgent: createDatabaseAgentExpectation(() => sqlite),
+		readServerOutputUntil,
 		testDirectory,
 	};
 }

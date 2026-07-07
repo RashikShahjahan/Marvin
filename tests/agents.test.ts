@@ -14,8 +14,27 @@ import {
 	webSearchTool,
 } from "./support/api.ts";
 
-const { client, createAgent, expectDatabaseAgent } =
+const { client, createAgent, expectDatabaseAgent, readServerOutputUntil } =
 	createApiTestContext("marvin-agents-api-");
+
+describe("API logging", () => {
+	test("logs request lifecycle", async () => {
+		const response = await client.get("/agents");
+
+		expect(response.status).toBe(200);
+		const serverOutput = await readServerOutputUntil(
+			'"type":"api.request.finish"',
+		);
+
+		expect(serverOutput).toContain(
+			'{"type":"api.request.start","method":"GET","path":"/agents"}',
+		);
+		expect(serverOutput).toContain('"method":"GET"');
+		expect(serverOutput).toContain('"path":"/agents"');
+		expect(serverOutput).toContain('"status":200');
+		expect(serverOutput).toContain('"duration_ms":');
+	});
+});
 
 describe("POST /agents", () => {
 	test("1. Create Agent - valid minimal request", async () => {

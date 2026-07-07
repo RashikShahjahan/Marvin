@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
-import express, { type Express, type Request, type Response } from "express";
+import express, {
+	type Express,
+	type NextFunction,
+	type Request,
+	type Response,
+} from "express";
 import { z } from "zod";
 import { createAgentResponse, parseAgentMessages } from "./agent.ts";
 import {
@@ -17,7 +22,7 @@ import {
 } from "./db.ts";
 
 const app: Express = express();
-const port = 3000;
+const port = process.env.PORT ?? "3000";
 
 const modelSchema = z.string().min(1);
 const toolSchema = z.string().min(1);
@@ -65,6 +70,39 @@ type AgentResponse = {
 	tools: string | null;
 };
 
+type ApiLogEntry = Record<string, string | number>;
+
+function writeApiLog(entry: ApiLogEntry): void {
+	process.stdout.write(`${JSON.stringify(entry)}\n`);
+}
+
+function logApiRequest(
+	request: Request,
+	response: Response,
+	next: NextFunction,
+): void {
+	const startedAt = Date.now();
+
+	writeApiLog({
+		type: "api.request.start",
+		method: request.method,
+		path: request.path,
+	});
+
+	response.on("finish", () => {
+		writeApiLog({
+			type: "api.request.finish",
+			method: request.method,
+			path: request.path,
+			status: response.statusCode,
+			duration_ms: Date.now() - startedAt,
+		});
+	});
+
+	next();
+}
+
+app.use(logApiRequest);
 app.use(express.json());
 
 function storedTools(tools: AgentTool[] | undefined): string | null {

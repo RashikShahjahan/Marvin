@@ -10,6 +10,7 @@ import {
 	createMarvinResponseClient,
 	handleDiscordMessage,
 	parseDiscordChannelAgents,
+	writeDiscordLog,
 	type DiscordMessage,
 	type MarvinFetch,
 } from "./discord.ts";
@@ -28,6 +29,12 @@ const marvinResponsesUrl = marvinResponsesEndpoint(marvinApiUrl);
 const marvinFetch: MarvinFetch = (_input, init) =>
 	fetch(marvinResponsesUrl, init);
 const createResponse = createMarvinResponseClient(marvinApiUrl, marvinFetch);
+
+writeDiscordLog({
+	type: "discord.bot.start",
+	configured_channels: channelAgents.size,
+});
+
 const client = new Client({
 	intents: [
 		GatewayIntentBits.Guilds,
@@ -37,12 +44,20 @@ const client = new Client({
 	partials: [Partials.Channel],
 });
 
+client.once(Events.ClientReady, (readyClient) => {
+	writeDiscordLog({
+		type: "discord.bot.ready",
+		user_id: readyClient.user.id,
+	});
+});
+
 client.on(Events.MessageCreate, async (message) => {
 	const action = await handleDiscordMessage(toDiscordMessage(message), {
 		channelAgents,
 		getThreadConversation: getDiscordThreadConversation,
 		saveThreadConversation: saveDiscordThreadConversation,
 		createResponse,
+		log: writeDiscordLog,
 	});
 
 	if (action.type === "reply") {
