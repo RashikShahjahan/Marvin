@@ -24,14 +24,16 @@ AGENTS_DB_PATH=agents.test.sqlite bun run index.ts
 ## Run the Discord bot
 
 The Discord bot runs as a separate process and talks to the Marvin API. Start the
-API server first, then configure the bot with a Discord token, the Marvin API
-URL, and the Discord-channel-to-agent mapping.
+API server first, then configure the bot with a `.env` file containing a
+Discord token, the Marvin API URL, and the Discord-channel-to-agent mapping.
 
 ```bash
-export DISCORD_TOKEN=your_discord_bot_token
-export MARVIN_API_URL=http://localhost:3000
-export DISCORD_CHANNEL_AGENTS=discord_channel_id=ag_123,\
-  another_channel_id=ag_456
+cat > .env <<'EOF'
+DISCORD_TOKEN=your_discord_bot_token
+MARVIN_API_URL=http://localhost:3000
+DISCORD_CHANNEL_AGENTS=discord_channel_id=ag_123,another_channel_id=ag_456
+EOF
+
 bun run discord
 ```
 

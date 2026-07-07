@@ -5,6 +5,7 @@ import {
 	Partials,
 	type Message,
 } from "discord.js";
+import { loadDiscordBotEnvironment } from "./discord-config.ts";
 import {
 	createMarvinResponseClient,
 	handleDiscordMessage,
@@ -17,12 +18,12 @@ import {
 	saveDiscordThreadConversation,
 } from "./db.ts";
 
-const discordToken = requiredEnvironmentVariable("DISCORD_TOKEN");
-const marvinApiUrl = requiredEnvironmentVariable("MARVIN_API_URL");
-const channelAgentConfiguration = requiredEnvironmentVariable(
-	"DISCORD_CHANNEL_AGENTS",
+const environment = loadDiscordBotEnvironment();
+const discordToken = environment.discordToken;
+const marvinApiUrl = environment.marvinApiUrl;
+const channelAgents = parseDiscordChannelAgents(
+	environment.discordChannelAgents,
 );
-const channelAgents = parseDiscordChannelAgents(channelAgentConfiguration);
 const marvinResponsesUrl = marvinResponsesEndpoint(marvinApiUrl);
 const marvinFetch: MarvinFetch = (_input, init) =>
 	fetch(marvinResponsesUrl, init);
@@ -71,14 +72,4 @@ function marvinResponsesEndpoint(apiUrl: string): string {
 	}
 
 	return url.toString();
-}
-
-function requiredEnvironmentVariable(name: string): string {
-	const value = process.env[name];
-
-	if (value === undefined || value.length === 0) {
-		throw new Error(`missing ${name}`);
-	}
-
-	return value;
 }
