@@ -30,6 +30,22 @@ sqlite.run(`
 	)
 `);
 
+sqlite.run(`
+	CREATE TABLE IF NOT EXISTS discord_channel_agents (
+		channel_id text PRIMARY KEY,
+		agent_id text NOT NULL
+	)
+`);
+
+sqlite.run(`
+	CREATE TABLE IF NOT EXISTS discord_thread_conversations (
+		thread_id text PRIMARY KEY,
+		channel_id text NOT NULL,
+		agent_id text NOT NULL,
+		conversation_id text NOT NULL
+	)
+`);
+
 const database = drizzle({ client: sqlite });
 
 const agentsTable = sqliteTable("agents", {
@@ -49,10 +65,29 @@ const conversationsTable = sqliteTable("conversations", {
 	updatedAt: text("updated_at").notNull(),
 });
 
+const discordChannelAgentsTable = sqliteTable("discord_channel_agents", {
+	channelId: text("channel_id").primaryKey(),
+	agentId: text("agent_id").notNull(),
+});
+
+const discordThreadConversationsTable = sqliteTable(
+	"discord_thread_conversations",
+	{
+		threadId: text("thread_id").primaryKey(),
+		channelId: text("channel_id").notNull(),
+		agentId: text("agent_id").notNull(),
+		conversationId: text("conversation_id").notNull(),
+	},
+);
+
 export type AgentRow = typeof agentsTable.$inferSelect;
 export type NewAgentRow = AgentRow;
 export type ConversationRow = typeof conversationsTable.$inferSelect;
 export type NewConversationRow = ConversationRow;
+export type DiscordThreadConversation = Omit<
+	typeof discordThreadConversationsTable.$inferSelect,
+	"threadId"
+>;
 
 export type AgentUpdate = {
 	name?: string;
@@ -97,6 +132,58 @@ export function getConversation(id: string): ConversationRow | undefined {
 		.select()
 		.from(conversationsTable)
 		.where(eq(conversationsTable.id, id))
+		.get();
+}
+
+export function setDiscordChannelAgent(
+	channelId: string,
+	agentId: string,
+): void {
+	database
+		.insert(discordChannelAgentsTable)
+		.values({ channelId, agentId })
+		.onConflictDoUpdate({
+			target: discordChannelAgentsTable.channelId,
+			set: { agentId },
+		})
+		.run();
+}
+
+export function getDiscordChannelAgent(channelId: string): string | undefined {
+	const row = database
+		.select({ agentId: discordChannelAgentsTable.agentId })
+		.from(discordChannelAgentsTable)
+		.where(eq(discordChannelAgentsTable.channelId, channelId))
+		.get();
+
+	return row?.agentId;
+}
+
+export function saveDiscordThreadConversation(
+	threadId: string,
+	conversation: DiscordThreadConversation,
+): void {
+	database
+		.insert(discordThreadConversationsTable)
+		.values({ threadId, ...conversation })
+		.onConflictDoUpdate({
+			target: discordThreadConversationsTable.threadId,
+			set: conversation,
+		})
+		.run();
+}
+
+export function getDiscordThreadConversation(
+	threadId: string,
+): DiscordThreadConversation | undefined {
+	return database
+		.select({
+			channelId: discordThreadConversationsTable.channelId,
+			agentId: discordThreadConversationsTable.agentId,
+			conversationId: discordThreadConversationsTable.conversationId,
+		})
+		.from(discordThreadConversationsTable)
+		.where(eq(discordThreadConversationsTable.threadId, threadId))
 		.get();
 }
 

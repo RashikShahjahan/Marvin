@@ -5,6 +5,7 @@
   "private": true,
   "scripts": {
     "cli": "bun run cli.ts",
+    "discord": "bun run discord-bot.ts",
     "test": "bun test tests"
   },
   "devDependencies": {
@@ -20,6 +21,7 @@
     "@earendil-works/pi-coding-agent": "^0.80.3",
     "@types/express": "^5.0.6",
     "axios": "^1.18.1",
+    "discord.js": "^14.26.4",
     "drizzle-orm": "^1.0.0-rc.4",
     "express": "^5.2.1",
     "zod": "^4.4.3"
