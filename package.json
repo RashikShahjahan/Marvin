@@ -3,13 +3,20 @@
   "module": "index.ts",
   "type": "module",
   "private": true,
+  "scripts": {
+    "start": "bun run index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.82.1",
     "@types/bun": "latest"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.82.1"
+    "@earendil-works/pi-coding-agent": "0.82.1",
+    "discord.js": "14.26.4"
   }
 }

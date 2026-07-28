@@ -21,9 +21,9 @@ Marvin is a personal AI assistant reached through Discord direct messages. The f
 2. **Discord visibility is the user boundary.** The application is private and visible only to the sole user. Marvin validates event shape but keeps no second user-ID allowlist.
 3. **Pi owns the agent and conversation history.** Marvin embeds `@earendil-works/pi-coding-agent`; Pi's native JSONL sessions are the only conversation store.
 4. **One continuing conversation.** Marvin resumes the most recent usable Pi session and exposes no conversation-switching control.
-5. **No prompt queue.** Marvin starts a prompt only while Pi is idle. A prompt received while Pi is running is rejected as busy without being forwarded or retained.
+5. **No application queues.** Marvin starts a prompt only while Pi is idle and sends Discord responses immediately. Overlapping prompts are rejected as busy without being forwarded or retained.
 6. **In-flight work is volatile.** A process exit may lose it.
-7. **Discord delivery is best effort.** Marvin preserves text and order during normal delivery but has no durable outbox or exactly-once guarantee.
+7. **Discord delivery is best effort.** Marvin preserves response text but does not coordinate concurrent sends or provide a durable outbox.
 8. **Shell isolation is an operating-system boundary.** A working directory is not a sandbox. Marvin must run as a dedicated non-root identity or in a suitably restricted container.
 
 ## System context
@@ -39,14 +39,10 @@ flowchart LR
     Transport[Discord transport]
     App[Marvin application]
     Pi[Pi assistant]
-    Lifecycle[Bootstrap and lifecycle]
-
     Transport --> App
     App --> Pi
     Pi --> App
     App --> Transport
-    Lifecycle --> Transport
-    Lifecycle --> Pi
   end
 
   Discord <--> Transport
@@ -61,12 +57,12 @@ Discord and the configured model provider are the only required network integrat
 
 | Component | Responsibility |
 | --- | --- |
-| Bootstrap and lifecycle | Validate configuration, create Pi before Discord login, install signal handling, and perform bounded shutdown. |
-| Discord transport | Accept valid one-to-one text DMs, ignore unsupported events, serialize outgoing responses, split long text, and disable mention expansion. |
+| Bootstrap | Validate configuration and create Pi before Discord login. |
+| Discord transport | Accept valid one-to-one text DMs, ignore unsupported events, split long text, and disable mention expansion. |
 | Marvin application | Route prompts, format acknowledgements and safe failures, and connect Pi outcomes to the sole output destination. |
-| Pi assistant | Own the active runtime and session, atomically admit one prompt at a time, reduce raw Pi events, handle terminal failures, and close cleanly. |
+| Pi assistant | Own the active runtime and session, admit one prompt at a time, reduce raw Pi events, and handle terminal failures. |
 
-These are responsibility boundaries, not separate services. Logging and message splitting are small implementation utilities rather than architectural components.
+These are responsibility boundaries, not separate services. Message splitting is a small implementation utility rather than an architectural component.
 
 ## Discord ingress
 
@@ -80,19 +76,19 @@ content.trim()   is non-empty
 
 Application visibility is trusted to ensure that an accepted DM belongs to the sole user. Guild messages, group DMs, bot messages, and empty messages are ignored. An attachment-only message receives a short text-only response. When a message contains both text and attachments, only its text is processed.
 
-Discord message IDs may be retained briefly for transport deduplication or logging, but they are not conversation state. Because every accepted message has the same output destination, Pi outcomes do not carry per-prompt Discord correlation objects.
+Discord message IDs are not retained as conversation state. Because every accepted message has the same output destination, Pi outcomes do not carry per-prompt Discord correlation objects.
 
 ## Prompt admission
 
 Inspection of Pi's current state and the corresponding operation form one atomic admission decision:
 
 ```text
-idle                -> start Pi prompt; acknowledge Working.
-running             -> reject without retaining text; report busy.
-shutting down       -> reject; report temporarily unavailable.
+idle                    -> start Pi prompt without an acknowledgement.
+running                 -> reject without retaining text; report busy.
+permanently unavailable -> reject; report temporarily unavailable.
 ```
 
-State inspection and prompt start are serialized so concurrent Discord events cannot both observe Pi as idle. Marvin never calls Pi's follow-up APIs. Text rejected while Pi is running remains available only in Discord history and must be sent again after the active request finishes.
+The active-run marker is set before admission awaits Pi, so concurrent Discord events cannot both observe Pi as idle. Marvin never calls Pi's follow-up APIs. Text rejected while Pi is running remains available only in Discord history and must be sent again after the active request finishes.
 
 ## Runtime state
 
@@ -103,11 +99,9 @@ stateDiagram-v2
   [*] --> Idle
   Idle --> Running: accepted prompt
   Running --> Idle: answer or request failure
-  Idle --> Closing: shutdown
-  Running --> Closing: shutdown
 ```
 
-The Pi assistant owns the operation guard so concurrent prompts cannot both start and prompt admission cannot race shutdown.
+The Pi assistant owns the active-run marker so concurrent prompts cannot both start.
 
 ## Primary flow
 
@@ -127,18 +121,17 @@ sequenceDiagram
   App->>Pi: Admit prompt
   alt Pi idle
     Pi-->>App: Started
-    App-->>Transport: Working.
     Pi->>Store: Persist native session entries
     Pi->>Model: Model and approved tool calls
     Model-->>Pi: Results
     Pi-->>App: Final text or safe failure category
     App->>Transport: User-visible response
-    Transport->>Discord: Ordered chunks
+    Transport->>Discord: Response chunks
     Discord-->>User: Complete response text
   else Pi running
     Pi-->>App: Busy
     App-->>Transport: Busy response; request not retained
-  else Shutting down
+  else Pi unavailable
     Pi-->>App: Unavailable
     App-->>Transport: Retry-later response
   else Admission failed
@@ -149,11 +142,11 @@ sequenceDiagram
 
 Raw model deltas, thinking blocks, tool arguments, tool output, and provider errors remain inside the Pi boundary. Only final assistant text, admission outcomes, and safe failure categories reach the application.
 
-## Failure handling and shutdown
+## Failure handling
 
 A terminal request failure emits one safe failure outcome and returns the assistant to idle after Pi settles. There is no pending prompt work to recover or discard.
 
-Graceful shutdown prevents new admission, aborts active work, awaits Pi settlement, and disposes the runtime. Detached processes remain unsupported.
+Fatal transport or Pi failures terminate the process directly. Normal operating-system signals use Bun's default process behavior.
 
 ## Persistence
 
@@ -166,7 +159,7 @@ Pi's native session format is authoritative and opaque to Marvin. Marvin uses Pi
 
 ## Discord output
 
-- Serialize complete logical responses so chunks and acknowledgements do not interleave.
+- Send each logical response immediately; concurrent responses may interleave.
 - Split text into chunks of at most 2,000 UTF-16 code units.
 - Prefer paragraph, newline, then whitespace boundaries before a hard split.
 - Preserve every source character in order and avoid splitting a UTF-16 surrogate pair.
@@ -174,7 +167,7 @@ Pi's native session format is authoritative and opaque to Marvin. Marvin uses Pi
 - Disable automatic user, role, and everyone mentions on every send.
 - Substitute a concise fallback when Pi returns no visible text.
 
-The Discord SDK owns rate-limit handling. Marvin does not maintain a durable replay buffer. A terminal send failure is logged with safe metadata and may leave a response partially delivered.
+The Discord SDK owns rate-limit handling. Marvin does not maintain a durable replay buffer. A terminal send failure may leave a response partially delivered.
 
 ## Failure behavior
 
@@ -183,10 +176,9 @@ The Discord SDK owns rate-limit handling. Marvin does not maintain a durable rep
 | Invalid configuration, unavailable credentials/model, or unusable workspace/session directory | Fail before Discord login with a safe actionable reason code. |
 | Prompt received while Pi is running | Reject it as busy without forwarding or retaining its text. |
 | Model or tool failure | Allow configured Pi retries, then report the failure and return to idle. |
-| Prompt admission failure | Report that the request was not accepted and do not retain its text. A fatal failure closes Pi and begins shutdown instead of suggesting a retry. |
-| Fatal Pi runtime failure | Send a safe failure if possible and begin shutdown. |
-| Discord send failure | Log safe metadata; do not replay after process restart. |
-| Graceful termination | Stop ingress, abort and dispose Pi's runtime, drain already-scheduled sends, and close Discord within a deadline. |
+| Prompt admission failure | Report that the request was not accepted and do not retain its text. A fatal failure terminates the process instead of suggesting a retry. |
+| Fatal Pi runtime failure | Attempt a safe failure response and terminate the process. |
+| Discord send failure | Do not replay after process restart. |
 | Process crash | Continue the most recent usable persisted Pi session; do not infer or replay volatile work. |
 
 Safe reason codes must be specific enough to guide remediation without exposing prompts, paths, provider messages, credentials, shell commands, or tool output.
@@ -212,4 +204,3 @@ The approved Pi tools are fixed application policy for the first release rather 
 6. Use a fixed built-in tool allowlist and prevent unapproved Pi extensions, packages, skills, prompts, or project settings from becoming executable resources.
 7. Keep Discord and provider credentials out of source control and session files.
 8. Protect and back up the session directory as sensitive personal data.
-9. Never log prompts, response bodies, thinking, shell commands, tool arguments/results, tokens, or credentials.
