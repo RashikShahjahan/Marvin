@@ -2,313 +2,193 @@
 
 **Status:** Proposed for the first release  
 **Inputs:** [`product.md`](./product.md) and [`architecture.md`](./architecture.md)  
-**Scope:** TypeScript/Bun program layout, module boundaries, types, method signatures, call stacks, and control-flow invariants. Service boundaries and persistence contracts remain owned by `architecture.md`.
+**Scope:** TypeScript/Bun modules, application-facing interfaces, control flow, and tests.
 
 ## Design summary
 
-Marvin is one Bun process with three stateful edges: Discord, one active Pi `AgentSessionRuntime`, and the process lifecycle. The implementation keeps those edges behind narrow adapters and leaves the conversation controller responsible only for orchestration.
+Marvin is one Bun process with two external adapters: Discord and Pi. A small application object connects them, while a lifecycle helper owns startup and shutdown.
 
-The central design choices are:
+The design deliberately uses the product's strongest simplifying invariant: every accepted prompt and every response belongs to one private Discord user. There is one output destination, so Marvin does not carry Discord correlation objects through the Pi runtime or maintain per-channel output state.
 
-1. Use `discord.js` v14 for Gateway events and DM sends.
-2. Put every Pi SDK call and raw Pi event behind `PiRuntimeBridge`; no other module imports Pi.
-3. Let Pi remain the only owner of prompt text after admission. Marvin keeps only Discord correlation IDs alongside Pi's queue, never a second prompt-text queue.
-4. Serialize session transitions (`!stop`, `!new`, shutdown), but do not await an entire model run in the controller. Waiting for `session.prompt()` to finish would prevent later DMs from reaching `session.followUp()`.
-5. Reduce raw Pi events immediately into small application events. Tool arguments, tool output, prompts, provider errors, and thinking blocks never reach the logger.
-6. Serialize outbound Discord chunks per channel and preserve source text at Discord's 2,000-character boundary, including fenced code blocks.
-7. Disable discovered Pi extensions, skills, prompt templates, themes, and context files for v1. Marvin supplies one application-owned system prompt and an explicit built-in tool allowlist.
+The central decisions are:
 
-## Dependency and file-tree diff
+1. Pin the Pi and Discord dependencies exactly and verify Pi's runtime contract with an integration test before relying on version-specific APIs.
+2. Keep all Pi imports and raw Pi events in one module.
+3. Expose one atomic `admit()` operation that starts work only while Pi is idle and reports busy otherwise.
+4. Do not queue prompts; text received while Pi is running is neither forwarded nor retained.
+5. Send outcomes to one serialized Discord output stream, without per-prompt correlation state.
+6. Keep terminal-failure handling and shutdown inside the modules that own the affected resources.
+7. Use small structural dependency types and injected functions for tests rather than a global domain module or general port hierarchy.
 
-Runtime dependencies are deliberately limited to:
+## Dependencies
+
+Runtime dependencies are pinned because the design depends on concrete SDK event and lifecycle behavior:
 
 ```json
 {
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.6",
-    "discord.js": "^14.26.4"
+    "@earendil-works/pi-coding-agent": "0.82.1",
+    "discord.js": "14.26.4"
   }
 }
 ```
 
-The implementation should have this shape:
+An upgrade is a deliberate change that must pass the Pi contract suite. The Bun lockfile remains committed.
 
-```diff
- marvin/
--├── index.ts                         # Bun placeholder
--├── package.json                     # Bun scaffold only
-+├── index.ts                         # composition root; no business logic
-+├── package.json                     # start/test scripts and runtime dependencies
-~├── README.md                        # configuration, security, and run instructions
-~├── bun.lock                         # dependency lockfile update
-+├── src/
-+│   ├── config.ts                    # parse and validate environment/filesystem config
-+│   ├── domain.ts                    # dependency-free application event/value types
-+│   ├── lifecycle.ts                 # startup ordering and bounded signal shutdown
-+│   ├── logger.ts                    # metadata-only structured event logger
-+│   ├── system-prompt.ts             # builds the application-owned Pi system prompt
-+│   ├── conversation/
-+│   │   ├── control-command.ts       # exact !stop / !new / !status parser
-+│   │   └── conversation-controller.ts # admission, controls, runtime-event orchestration
-+│   ├── discord/
-+│   │   └── discord-gateway.ts       # discord.js ingress and outbound transport
-+│   ├── pi/
-+│   │   ├── pi-event-mapper.ts       # pure raw-event classification/text extraction
-+│   │   └── pi-runtime-bridge.ts      # AgentSessionRuntime ownership and rebinding
-+│   └── presentation/
-+│       ├── response-presenter.ts    # ordered chunks, retries, safe mentions
-+│       └── split-discord-message.ts # pure 2,000-char/fence-aware splitter
-+└── tests/
-+    ├── config.test.ts
-+    ├── control-command.test.ts
-+    ├── discord-gateway.test.ts
-+    ├── conversation-controller.test.ts
-+    ├── lifecycle.test.ts
-+    ├── pi-event-mapper.test.ts
-+    ├── pi-runtime-bridge.test.ts
-+    ├── response-presenter.test.ts
-+    ├── split-discord-message.test.ts
-+    └── support/fakes.ts
-```
-
-Dependency direction is one-way:
+## File layout
 
 ```text
-index.ts / lifecycle.ts
-  -> ConversationController
-       -> PiRuntimeBridge
-       -> ResponsePresenter
-  -> DiscordGateway
-
-PiRuntimeBridge       -> Pi SDK
-DiscordGateway        -> discord.js
-ResponsePresenter     -> DiscordOutput port
-all application code  -> domain.ts + typed logger
+marvin/
+├── index.ts                    # composition root only
+├── src/
+│   ├── config.ts               # environment and filesystem validation
+│   ├── discord.ts              # Discord ingress and serialized output
+│   ├── lifecycle.ts            # early signals and bounded cleanup
+│   ├── log.ts                  # safe structured metadata
+│   ├── marvin.ts               # user-visible orchestration
+│   ├── pi.ts                   # all Pi construction, admission, state, and events
+│   └── split-message.ts        # pure Discord-size splitter
+└── tests/
+    ├── config.test.ts
+    ├── discord.test.ts
+    ├── lifecycle.test.ts
+    ├── marvin.test.ts
+    ├── pi.test.ts
+    ├── pi-contract.test.ts
+    ├── split-message.test.ts
+    └── support.ts
 ```
 
-`discord.js` types do not cross into the controller, and Pi types do not cross out of `src/pi/`.
+Small types live with the module that owns them. The system prompt is a constant in `pi.ts` until its size or independent evolution justifies a separate file.
 
-## Shared application types
+Dependency direction is straightforward:
 
-`src/domain.ts` defines the values exchanged between modules. IDs remain opaque strings.
-
-```ts
-export interface DiscordCorrelation {
-  messageId: string
-  channelId: string
-}
-
-export interface UserPrompt extends DiscordCorrelation {
-  text: string
-  receivedAt: Date
-}
-
-export type DiscordIngress =
-  | { type: 'prompt'; prompt: UserPrompt }
-  | { type: 'attachment_only'; correlation: DiscordCorrelation }
-
-export type AgentStatus =
-  | { phase: 'idle'; queued: 0 }
-  | { phase: 'running'; queued: number }
-
-export type RuntimeEvent =
-  | { type: 'agent_started'; sessionId: string }
-  | { type: 'queue_changed'; sessionId: string; queued: number }
-  | {
-      type: 'assistant'
-      sessionId: string
-      correlation: DiscordCorrelation
-      text: string
-    }
-  | {
-      type: 'failed'
-      sessionId: string
-      correlation: DiscordCorrelation
-      errorId: string
-    }
-  | {
-      type: 'tool_state'
-      sessionId: string
-      toolName: string
-      state: 'started' | 'succeeded' | 'failed'
-    }
-  | { type: 'settled'; sessionId: string }
-
-export interface DiscordOutput {
-  send(channelId: string, content: string): Promise<{ messageId: string }>
-}
-
-export type RuntimeAbortReason = 'stop' | 'new' | 'shutdown'
-
-export interface RuntimePort {
-  readonly sessionId: string
-  getStatus(): AgentStatus
-  startPrompt(prompt: UserPrompt): Promise<void>
-  queueFollowUp(prompt: UserPrompt): Promise<number>
-  stop(reason: RuntimeAbortReason): Promise<void>
-  newConversation(): Promise<string>
-}
-
-export interface PresenterPort {
-  present(request: DiscordCorrelation & { text: string }): Promise<void>
-  drain(): Promise<void>
-}
-
+```text
+index.ts -> config, lifecycle, log, discord, marvin, pi
+marvin.ts -> structural Pi and send dependencies
+discord.ts -> discord.js, split-message, log
+pi.ts -> Pi SDK, config, log
 ```
 
-`RuntimeEvent.assistant.text` is sensitive user data intended only for presentation. The logger's type does not accept it.
+No module other than `discord.ts` imports `discord.js`, and no module other than `pi.ts` imports the Pi SDK.
 
-## Configuration shape
+## Configuration
 
-`src/config.ts` exposes one validated value and no module reads `process.env` directly afterward.
+`src/config.ts` is the only module that reads environment variables.
 
 ```ts
-export const DEFAULT_TOOLS = ['read', 'bash', 'grep', 'find', 'ls'] as const
-export const DEFAULT_MAX_PENDING = 3
+export const APPROVED_TOOLS = ['read', 'bash', 'grep', 'find', 'ls'] as const
 
 export interface MarvinConfig {
   discordToken: string
-  workspace: string             // canonical absolute directory
-  sessionDir: string            // canonical dedicated directory
-  model?: string                // Pi provider/model[:thinking] selector
-  tools: readonly string[]
-  maxPending: number
+  workspace: string
+  sessionDir: string
+  model?: string
 }
 
-export interface LoadConfigOptions {
-  defaultSessionDir: string
+export async function loadConfig(options: {
   env?: Readonly<Record<string, string | undefined>>
-}
-
-export async function loadConfig(options: LoadConfigOptions): Promise<MarvinConfig>
+  defaultSessionDir: string
+}): Promise<MarvinConfig>
 ```
 
-`loadConfig` performs all environment, filesystem, and syntax checks before Discord login:
+`loadConfig` performs these checks before Discord login:
 
 - `DISCORD_TOKEN` is present and non-blank;
-- `MARVIN_WORKSPACE` is an absolute, existing, readable directory and is canonicalized with `realpath`;
-- `MARVIN_SESSION_DIR`, when absent, uses `options.defaultSessionDir` (`<Pi agent dir>/marvin/sessions` from the composition root);
-- the session directory is created with mode `0700` when absent, checked for read/write access, and rejected on POSIX when group/other permission bits are present;
-- `MARVIN_MAX_PENDING` is an integer from `0` through `100`;
-- `MARVIN_TOOLS` is a comma-separated subset of Pi's built-ins (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`), contains `bash`, and has no duplicates;
-- a present but blank `MARVIN_MODEL` is rejected; a non-blank selector is resolved and validated by `PiRuntimeBridge.create` before Discord login.
+- `MARVIN_WORKSPACE` is absolute, resolves through `realpath`, is a directory, and is readable/searchable;
+- `MARVIN_SESSION_DIR` defaults to a Marvin-specific Pi directory, is created with mode `0700` when absent, resolves through `realpath`, and is readable/writable/searchable;
+- the session directory has no group or other permission bits on POSIX; and
+- a present `MARVIN_MODEL` is non-blank.
 
-The Discord token is retained only in `MarvinConfig` and passed to `DiscordGateway.start`. It is never included in an error object or log event.
+The Pi module performs model, authentication, effective-tool, settings, and resource validation because it owns the SDK objects needed for those checks. There is no `MARVIN_USER_ID` or `MARVIN_TOOLS` setting.
 
-## System prompt
+## Safe logging
 
-`src/system-prompt.ts` keeps product behavior separate from Pi runtime construction:
+`src/log.ts` accepts a small discriminated union. It does not accept arbitrary objects or `Error` instances.
 
 ```ts
-export function buildMarvinSystemPrompt(): string
-```
-
-The prompt identifies Marvin as a personal assistant operating through Discord, asks for concise Discord-compatible Markdown, permits approved tools for user-requested tasks, requires truthful reporting of tool outcomes, and tells the model to ask for clarification before materially ambiguous actions. It does not contain credentials, filesystem paths, queue/control-command behavior, or claims that the workspace is a security sandbox. Pi still supplies tool schemas for the allowlisted tools.
-
-## Metadata-only logging
-
-`src/logger.ts` uses a discriminated union rather than `log(message, arbitraryObject)`. This makes unsafe fields difficult to add accidentally.
-
-```ts
-export type AgentLogState =
-  | 'started'
-  | 'queue_changed'
-  | 'retry_started'
-  | 'retry_finished'
-  | 'settled'
-
-export type OperationName =
-  | 'config'
-  | 'pi_create'
-  | 'prompt'
-  | 'follow_up'
-  | 'session_stop'
-  | 'session_new'
-  | 'discord_ingress'
-  | 'discord_send'
-  | 'shutdown'
+export type FailureReason =
+  | 'invalid_config'
+  | 'workspace_unavailable'
+  | 'session_unavailable'
+  | 'model_unavailable'
+  | 'authentication_unavailable'
+  | 'runtime_failed'
+  | 'discord_failed'
+  | 'shutdown_failed'
 
 export type LogEvent =
-  | { type: 'startup_ready'; sessionId: string }
-  | { type: 'shutdown'; reason: 'SIGINT' | 'SIGTERM' | 'startup_error' }
-  | { type: 'discord_ignored'; reason: 'bot' | 'non_dm' | 'empty' }
-  | { type: 'runtime_diagnostics'; info: number; warnings: number; errors: number }
-  | { type: 'agent_state'; sessionId: string; state: AgentLogState; queued?: number }
-  | {
-      type: 'tool_state'
-      sessionId: string
-      toolName: string
-      state: 'started' | 'succeeded' | 'failed'
-    }
-  | { type: 'operation_failed'; operation: OperationName; errorId: string }
-  | {
-      type: 'discord_send_failed'
-      sourceMessageId?: string
-      chunkIndex: number
-      attempt: number
-      errorId: string
-    }
+  | { type: 'ready' }
+  | { type: 'state'; state: 'running' | 'idle' }
+  | { type: 'failure'; reason: FailureReason; errorId: string }
+  | { type: 'shutdown'; reason: 'SIGINT' | 'SIGTERM' | 'fatal' }
 
 export interface Logger {
   emit(event: LogEvent): void
 }
 
 export function createErrorId(): string
-export function createJsonLogger(output?: Pick<Console, 'log'>): Logger
+export function createJsonLogger(): Logger
 ```
 
-The logger never accepts an `Error`, error name/message, stack, free-form message, prompt, response body, shell command, tool arguments/result, token, or credential. Catch sites reduce failures to a fixed `OperationName` plus a generated error ID.
+Safe reason codes make failures actionable without logging paths, prompts, responses, provider messages, thinking, shell commands, tool arguments/results, tokens, or credentials. Tool lifecycle telemetry is omitted from the first release.
 
-## Discord gateway
+## Discord transport
 
-`src/discord/discord-gateway.ts` owns the `discord.js` `Client` and converts `Message` objects before invoking application code.
+`src/discord.ts` owns the Discord client, ingress conversion, the accepted DM channel, and one global output tail.
 
 ```ts
-export type DiscordIngressHandler = (event: DiscordIngress) => Promise<void>
-export type FatalHandler = (errorId: string) => void
+export type DiscordIngress =
+  | { type: 'prompt'; text: string }
+  | { type: 'attachment_only' }
 
-export function toDiscordIngress(message: Message): DiscordIngress | undefined
-export function createDiscordMessageOptions(content: string): MessageCreateOptions
+export type IngressHandler = (event: DiscordIngress) => Promise<void>
 
-export class DiscordGateway implements DiscordOutput {
-  constructor(private readonly logger: Logger)
+export class DiscordTransport {
+  constructor(logger: Logger, clientFactory?: DiscordClientFactory)
 
   start(
     token: string,
-    onIngress: DiscordIngressHandler,
-    onFatal: FatalHandler,
+    onIngress: IngressHandler,
+    onFatal: (reason: FailureReason, errorId: string) => void,
   ): Promise<void>
+
+  send(text: string): Promise<void>
   stopAccepting(): void
-  send(channelId: string, content: string): Promise<{ messageId: string }>
+  drain(): Promise<void>
   close(): Promise<void>
+  destroy(): void
 }
 ```
 
-The client is created with:
+The optional client factory is an internal test seam, not an application port.
+
+The client requests only the direct-message gateway behavior needed by the private application. For the pinned discord.js version, the intended construction is:
 
 ```ts
 new Client({
-  intents: [
-    GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.MessageContent,
-  ],
+  intents: [GatewayIntentBits.DirectMessages],
   partials: [Partials.Channel],
 })
 ```
 
-`MessageCreate` conversion is intentionally strict:
+Direct-message content availability without the privileged `MessageContent` intent must be confirmed by a local Discord smoke test. The intent is added only if that test demonstrates it is required.
+
+Ingress conversion is strict:
 
 ```text
-message.author.bot                         -> ignore
-message.channel.type !== ChannelType.DM   -> ignore
-trimmed content is empty + attachments    -> attachment_only
-trimmed content is empty                  -> ignore
-otherwise                                 -> prompt using original content
+message.author.bot                       -> ignore
+message.channel.type !== ChannelType.DM -> ignore
+trimmed content empty + attachments      -> attachment_only
+trimmed content empty                    -> ignore
+otherwise                                -> prompt with original content
 ```
 
-Using `ChannelType.DM` rather than `isDMBased()` excludes group DMs. A text message with attachments processes only its text; attachment data and URLs do not enter Pi.
+No author-ID check is performed. Private application visibility is the authorization boundary defined by the product and architecture.
 
-Every outbound send resolves/fetches the channel by ID, verifies it is a sendable DM, and passes `createDiscordMessageOptions(content)` to `channel.send`. The helper returns:
+The `MessageCreate` listener attaches a terminal catch to every ingress promise. The Discord client also has an `error` listener, so an EventEmitter rejection or error cannot become an unhandled process failure.
+
+On the first accepted event, the transport records its one-to-one DM as the sole output destination. Every send uses:
 
 ```ts
 {
@@ -317,512 +197,290 @@ Every outbound send resolves/fetches the channel by ID, verifies it is a sendabl
 }
 ```
 
-The gateway does not retry or split messages; those policies belong to `ResponsePresenter`. The `MessageCreate` listener attaches a terminal catch to each `onIngress` promise so an EventEmitter callback can never create an unhandled rejection; unexpected failures are reduced to the fixed `discord_ingress` operation and trigger the composition root's fatal path. `stopAccepting` detaches the ingress listener without destroying the client so shutdown acknowledgements already in flight may finish.
+`send(text)` synchronously appends one logical response to a global promise tail, then:
 
-## Pi event mapper
+1. calls `splitMessage(text)`;
+2. sends each chunk sequentially;
+3. stops that logical response after a terminal send failure; and
+4. recovers the tail so a failure cannot permanently block later responses.
 
-`src/pi/pi-event-mapper.ts` contains pure narrowing helpers and is the only place that knows Pi assistant-message content shapes.
+There is no application retry clock. discord.js handles rate limits; ambiguous transport retries could duplicate a chunk. A send failure is logged with a safe reason and delivery remains best effort.
+
+`close()` performs normal idempotent client cleanup. `destroy()` synchronously begins the same idempotent socket teardown without waiting and is safe for the lifecycle hard-deadline path.
+
+## Message splitting
+
+`src/split-message.ts` exports one pure function:
 
 ```ts
-import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent'
-
-type MessageEndEvent = Extract<AgentSessionEvent, { type: 'message_end' }>
-type AgentEndEvent = Extract<AgentSessionEvent, { type: 'agent_end' }>
-
-export type AssistantClassification =
-  | { kind: 'intermediate' }                  // stopReason: toolUse
-  | { kind: 'answer'; text: string }          // stop or length
-  | { kind: 'failed' }                        // error
-  | { kind: 'aborted' }
-
-export function classifyAssistantMessage(
-  event: MessageEndEvent,
-): AssistantClassification | undefined
-
-export function hasTerminalAgentFailure(event: AgentEndEvent): boolean
+export function splitMessage(source: string, limit = 2_000): string[]
 ```
 
-Text extraction concatenates only `{ type: 'text' }` blocks in source order. Thinking and tool-call blocks are excluded. `toolUse` messages are intermediate and never posted. `stop` and `length` are presentable terminal answers; an empty answer is allowed through so the presenter can provide its standard fallback.
+Its invariants are:
 
-An `error` message is not immediately public because Pi may retry it. `hasTerminalAgentFailure` is consulted only on `agent_end` where `willRetry === false`.
+1. a `limit` that is not a safe integer of at least `2` throws `RangeError` because a UTF-16 surrogate pair needs two code units;
+2. empty input returns `[]`;
+3. every returned chunk is non-empty and at most `limit` UTF-16 code units;
+4. `chunks.join('') === source`;
+5. break selection prefers paragraph, newline, whitespace, then a hard boundary;
+6. a hard boundary never divides a UTF-16 surrogate pair; and
+7. the algorithm always consumes at least one source character.
 
-## Pi runtime bridge
+Empty final assistant text is replaced before splitting with `I finished, but there was no text response.` Markdown fence reconstruction is deliberately omitted because it conflicts with bounded output for pathological fence lines and is not required to preserve source text.
 
-`src/pi/pi-runtime-bridge.ts` owns the runtime, active-session subscription, queue correlation metadata, and abort suppression.
+## Pi assistant
+
+`src/pi.ts` owns every Pi SDK object, the active session subscription, admission state, failure handling, and raw event reduction.
+
+### Application-facing API
 
 ```ts
-export type RuntimeListener = (event: RuntimeEvent) => void
+export type Admission =
+  | { kind: 'started' }
+  | { kind: 'busy' }
+  | { kind: 'unavailable' }
+  | { kind: 'failed'; errorId: string; fatal: boolean }
 
-export class PiRuntimeError extends Error {
-  constructor(
-    readonly errorId: string,
-    readonly operation: 'prompt' | 'follow_up' | 'session_stop' | 'session_new',
-  )
-}
+export type AssistantOutcome =
+  | { type: 'answer'; text: string }
+  | { type: 'failure'; reason: 'request_failed'; errorId: string }
+  | { type: 'fatal'; reason: 'runtime_failed'; errorId: string }
 
-export class PiRuntimeBridge implements RuntimePort {
+export class PiAssistant {
   static defaultSessionDir(): string
-  static create(config: MarvinConfig, logger: Logger): Promise<PiRuntimeBridge>
+  static create(config: MarvinConfig, logger: Logger): Promise<PiAssistant>
 
-  subscribe(listener: RuntimeListener): () => void
-  get sessionId(): string
-  getStatus(): AgentStatus
-
-  // Resolves after prompt preflight acceptance, not after the model run.
-  startPrompt(prompt: UserPrompt): Promise<void>
-
-  // Returns Pi's queue position after admission.
-  queueFollowUp(prompt: UserPrompt): Promise<number>
-
-  stop(reason: RuntimeAbortReason): Promise<void>
-  newConversation(): Promise<string>
-  dispose(): Promise<void>
+  subscribe(listener: (outcome: AssistantOutcome) => void): () => void
+  admit(text: string): Promise<Admission>
+  close(): Promise<void>
 }
 ```
 
-`getStatus` reads the current session's `isStreaming` and `pendingMessageCount` directly; `queue_changed` events are observational and are not a second cached source of truth.
+The application never sees session IDs, raw Pi events, model objects, tool state, or other SDK state.
 
-### Runtime construction
+### Construction
 
-The bridge follows the Pi runtime factory pattern so `runtime.newSession()` can replace the active session safely:
+`PiAssistant.create`:
 
-```text
-PiRuntimeBridge.create
-  AuthStorage.create()
-  ModelRegistry.create(authStorage)
-  createRuntime({ cwd, sessionManager, sessionStartEvent })
-    services = await createAgentSessionServices({
-      cwd,
-      agentDir,
-      authStorage,
-      modelRegistry,
-      resourceLoaderOptions: {
-        noExtensions: true,
-        noSkills: true,
-        noPromptTemplates: true,
-        noThemes: true,
-        noContextFiles: true,
-        systemPrompt: buildMarvinSystemPrompt(),
-        appendSystemPrompt: [],
-      },
-    })
-    services.settingsManager.applyOverrides({ followUpMode: 'one-at-a-time' })
-    resolveConfiguredModel(config.model, modelRegistry)
-    result = await createAgentSessionFromServices({
-      services,
-      sessionManager,
-      sessionStartEvent,
-      model,
-      thinkingLevel,
-      tools: config.tools,
-    })
-    await validateCreatedRuntime(result, services, config)
-    return { ...result, services, diagnostics: services.diagnostics }
-  SessionManager.continueRecent(workspace, sessionDir)
-  runtime = await createAgentSessionRuntime(createRuntime, initialTarget)
-  runtime.setRebindSession(bindSession)
-  await bindSession(runtime.session)
-```
+1. creates Pi authentication, model, settings, and resource services for the validated workspace;
+2. disables extensions, skills, prompt templates, themes, context files, and package-provided executable resources;
+3. applies an application-owned system prompt;
+4. selects only `APPROVED_TOOLS` and verifies the effective tool set;
+5. resolves an exact configured model or Pi's valid default model;
+6. verifies model authentication without logging credential details;
+7. continues the most recent usable session through Pi's session APIs; and
+8. binds one event listener to the active session.
 
-`bindSession(session)` performs three operations in order:
+Pi settings that can alter shell execution or load packages must not be inherited unchecked. The exact pinned SDK calls required to sanitize those settings and resources are established by `pi-contract.test.ts`, not duplicated as an architectural dependency throughout the application.
 
-1. unsubscribe the old session listener;
-2. `await session.bindExtensions({})` (the extension set is empty, but Pi's runtime lifecycle is still bound correctly);
-3. subscribe to the new session and capture its `sessionId` in the callback.
+The application system prompt identifies Marvin as a concise Discord assistant, permits approved tools for user-requested work, requires truthful tool reporting, and asks for clarification before materially ambiguous actions. It contains no credentials or claims that the workspace is a sandbox. Pi may add provider-visible runtime context such as the current working directory.
 
-`validateCreatedRuntime` runs inside the reusable factory, so it protects both startup and `!new`. It fails when a runtime diagnostic has type `error`, a configured model selector cannot be resolved, the requested tools are not exactly the active allowlist, no model is selected, or `modelRegistry.getApiKeyAndHeaders(model)` cannot resolve request authentication. It disposes the just-created session before throwing. Diagnostics are logged only as typed severity counts, not raw diagnostic text. `SessionManager.continueRecent` errors propagate; the bridge must not replace an unreadable recent session with a blank one.
+### Atomic admission
 
-### Prompt admission without blocking follow-ups
-
-`AgentSession.prompt()` resolves after the whole run, so `startPrompt` must not expose that promise as the admission boundary.
+`admit()` owns state inspection and the corresponding Pi mutation under one short operation gate:
 
 ```text
-startPrompt(prompt)
-  assert current session is idle
-  append prompt.correlation to pendingCorrelations
-  call session.prompt(prompt.text, { preflightResult })
-  retain completion promise and attach failure handler
-  await preflightResult
-    false -> remove correlation and reject admission
-    true  -> return to controller while completion continues
+closing or permanently closed
+  -> unavailable
+
+session streaming
+  -> busy without calling a Pi prompt API or retaining text
+
+session idle
+  -> start prompt
+  -> attach completion failure handling immediately
+  -> await only Pi's prompt-preflight acceptance boundary
+  -> started or failed
 ```
 
-`queueFollowUp` adds only the correlation metadata, awaits `session.followUp(prompt.text)`, and returns `session.pendingMessageCount`. If Pi rejects the follow-up, the matching metadata entry is removed before the error is surfaced.
+The operation gate is never held for the complete model run. This allows later Discord events to observe the active run and receive `busy` promptly.
 
-The bridge keeps:
+Expected Pi preflight rejections are reduced to `{ kind: 'failed', errorId, fatal }`; they do not escape to the Discord listener's terminal catch. Rejected prompt text is not retained. `fatal` is true only when the Pi assistant can no longer admit work safely, in which case it marks itself permanently closed under the admission gate before returning.
 
-```ts
-private pendingCorrelations: DiscordCorrelation[] = []
-private activeCorrelation: DiscordCorrelation | undefined
-```
+Pi remains the only owner of prompt text after admission. Because every answer goes to the same private DM and only one prompt can run, Marvin keeps no FIFO of prompt text, message IDs, or channel IDs. Discord's global output tail preserves acknowledgement and response order during sending.
 
-On a Pi user `message_start`, it shifts the oldest correlation into `activeCorrelation`. On a terminal answer or terminal failure, it emits that correlation and clears it. This FIFO contains no prompt text and is not a conversation store; Pi's follow-up queue remains authoritative. Queue clear, reset, and shutdown clear pending correlation IDs at the same time as `session.clearQueue()`.
+The completion promise from an initial `prompt()` always has a rejection handler attached before admission returns. A late rejection becomes exactly one safe failure outcome unless the assistant is closing.
 
-### Raw Pi event reduction
+### Event reduction
 
-| Pi event | Bridge behavior |
+Raw Pi events are handled entirely in `pi.ts`:
+
+| Pi event | Behavior |
 | --- | --- |
-| `agent_start` | Emit `agent_started`; no prompt content. |
-| `queue_update` | Emit only `followUp.length`; discard both text arrays immediately. |
-| user `message_start` | Advance opaque Discord correlation metadata. |
-| `tool_execution_start` | Emit tool name and `started`; discard args. |
-| `tool_execution_end` | Emit tool name and success/error flag; discard result. |
-| `message_update` | Ignore; Discord receives no token deltas. |
-| assistant `message_end` with `toolUse` | Ignore as intermediate. |
-| assistant `message_end` with `stop`/`length` | Emit one `assistant` event when an active correlation exists; otherwise log metadata only. |
-| assistant `message_end` with `error` | Retain no error text; wait for `agent_end`. |
-| assistant `message_end` with `aborted` | Suppress. |
-| `agent_end` with `willRetry: true` | Keep the run active and emit no public failure. |
-| terminal failed `agent_end` | Generate an error ID and emit one `failed` event when an active correlation exists; otherwise log metadata only. |
-| `auto_retry_start/end` | Metadata-only lifecycle log; no public message unless retries end in failure. |
-| `agent_settled` | Emit `settled` as the terminal idle boundary for lifecycle logging. |
+| Agent start and settled | Update safe state logging only. |
+| Message update | Ignore token deltas. |
+| Assistant message containing a tool-call block | Treat as intermediate, regardless of stop reason. |
+| Assistant `error` result | Wait for Pi's terminal retry decision. |
+| Assistant `aborted` result | Suppress during shutdown. |
+| Terminal assistant message without tool calls | Concatenate text blocks in source order and emit one answer. |
+| Terminal agent failure after retries | Emit one safe failure. |
+| Tool events | Do not forward or log arguments, results, or commands. |
 
-Every callback captures the bound session ID. Events from a replaced session are ignored if that ID is no longer current.
+Thinking and non-text content are never included in Discord output. After a terminal request failure, Pi settlement returns the assistant to `idle`; until then, admission remains `busy`. Application listener failures are caught so they cannot reject back into Pi's event pipeline.
 
-### Stop, reset, and disposal
+### Failure handling and close
+
+The close flag is set under the operation gate before the first await, which immediately closes prompt admission.
 
 ```text
-stop(reason)
-  mark current session as abort-suppressed
-  session.clearQueue()           # discard returned text arrays without inspection
-  clear pending correlation metadata
-  await session.abort()          # resolves after Pi becomes idle
-  clear active correlation
+terminal failure
+  emit one safe failure outcome
+  allow new admission after Pi settles
 
-newConversation()
-  stop('new')
-  runtime.newSession()
-    createRuntime(... SessionManager for new JSONL ...)
-    runtime rebind callback -> bindSession(new session)
-  return runtime.session.sessionId
+fatal runtime failure
+  mark permanently closed
+  emit one fatal outcome
 
-dispose()
-  if shutdown stop has not already completed
-    stop('shutdown')
-  unsubscribe session listener
-  await runtime.dispose()
+close
+  mark permanently closed
+  suppress the interrupted outcome
+  abort active work if needed
+  unsubscribe
+  dispose the runtime
 ```
 
-Abort suppression prevents an expected `aborted` assistant message from becoming a public failure. A `runtime.newSession()` result with `cancelled: true` is treated as an internal failure even though v1 has no extension capable of cancelling it.
+`close()` awaits Pi settlement before disposing the runtime. The Pi contract suite verifies that abort ends Pi-managed foreground shell processes before settlement; detached processes remain unsupported. A close failure is handled by the lifecycle's bounded cleanup path rather than emitted as a user-visible response.
 
-Pi tears down the old session before its runtime factory creates the replacement. Therefore, any throw from `runtime.newSession()` leaves the bridge unusable: the bridge marks itself closed, throws a `PiRuntimeError`, and accepts no later prompts. The controller queues one error response, calls `onFatal(errorId)`, and stays out of `ready`; the composition root then performs bounded shutdown.
+## Marvin application
 
-## Conversation controller
-
-`src/conversation/conversation-controller.ts` interprets ingress, admits prompts, and maps reduced runtime events to logging and presentation operations.
+`src/marvin.ts` contains no Discord or Pi SDK imports. Its dependencies are structural and small:
 
 ```ts
-export class ConversationController {
-  constructor(dependencies: {
-    runtime: RuntimePort
-    presenter: PresenterPort
-    logger: Logger
-    maxPending: number
-    onFatal: (errorId: string) => void
-  })
+interface AssistantDependency {
+  admit(text: string): Promise<Admission>
+}
 
-  handleIngress(event: DiscordIngress): Promise<void>
-  handleRuntimeEvent(event: RuntimeEvent): void
-  beginShutdown(): void
+type Send = (text: string) => Promise<void>
+type FatalHandler = (reason: FailureReason, errorId: string) => void
+
+export class Marvin {
+  constructor(
+    assistant: AssistantDependency,
+    send: Send,
+    onFatal: FatalHandler,
+  )
+  handle(event: DiscordIngress): Promise<void>
+  handleOutcome(outcome: AssistantOutcome): void
+  closeAdmission(): void
 }
 ```
 
-`src/conversation/control-command.ts` is pure:
-
-```ts
-export type ControlCommand = 'stop' | 'new' | 'status'
-
-export function parseControlCommand(text: string): ControlCommand | undefined
-```
-
-It trims and compares case-insensitively, but accepts only the exact three commands. `!stop now`, `!new please`, and ordinary text containing those strings are prompts.
-
-The controller has a small transition state:
-
-```ts
-type ControllerPhase = 'ready' | 'stopping' | 'resetting' | 'shutting_down'
-```
-
-A short promise-based critical section serializes state inspection plus one Pi admission call. Long stop/reset work sets a transition phase before releasing that critical section. A normal prompt arriving during a transition receives `Conversation is changing; try again in a moment.` rather than being stored by Marvin. Control transitions are serialized with each other. This synchronization is not a second prompt queue.
+Marvin does not parse user-facing commands. Every accepted text DM, including text beginning with `!`, is passed unchanged to `admit()`.
 
 Prompt behavior is:
 
 ```text
-attachment_only
-  presenter.present({ ...correlation, text: "Text messages only for now." })
-
-prompt while phase != ready
-  presenter.present({ ...prompt, text: "Conversation is changing; try again in a moment." })
-
-prompt while Pi idle
-  runtime.startPrompt(prompt)     # await acceptance only
-
-prompt while Pi running and queued < maxPending
-  position = runtime.queueFollowUp(prompt)
-  presenter.present({ ...prompt, text: "Queued (position <position> of <maxPending> maximum)." })
-
-prompt while Pi running and queued >= maxPending
-  presenter.present({ ...prompt, text: "Queue is full; try again after the current work finishes." })
+attachment only -> Text messages only for now.
+started         -> Working.
+busy            -> Marvin is already working; try again after it finishes.
+unavailable     -> Marvin is temporarily unavailable; try again in a moment.
+failed          -> report not accepted; suggest retry only when nonfatal; otherwise call onFatal
+closed          -> Marvin is shutting down; request not accepted.
 ```
 
-If initial prompt admission or follow-up queueing fails, the controller sends `I couldn't start that request (error <id>). Try again or send !new.` It never includes Pi's underlying error message.
+An answer is sent verbatim unless empty, in which case the standard fallback is used. A nonfatal admission failure says that the request was not accepted and can be retried. A fatal admission failure says Marvin must restart and invokes `onFatal('runtime_failed', errorId)`. A terminal request failure sends `I couldn't complete that request (error <id>). Retry it.` A fatal outcome sends a safe response if possible and invokes `onFatal` with `runtime_failed`.
 
-Control behavior is:
+`handleOutcome` never awaits Discord from inside a Pi callback. `DiscordTransport.send` appends synchronously to its output tail, and `handleOutcome` attaches a terminal catch to the returned promise.
 
-```text
-!status
-  idle                  -> "idle"
-  running, zero queued  -> "running"
-  running, N queued     -> "running; N queued"
+## Lifecycle and composition
 
-!stop
-  phase = stopping
-  await runtime.stop('stop')
-  phase = ready
-  presenter.present({ ...commandCorrelation, text: "Stopped." })
-
-!new
-  phase = resetting
-  await runtime.newConversation()
-  phase = ready
-  presenter.present({ ...commandCorrelation, text: "Started a new conversation." })
-```
-
-The controller subscribes once to `PiRuntimeBridge` after all dependencies exist. `handleRuntimeEvent` ignores any session ID other than `runtime.sessionId` and then:
-
-- emits metadata-only lifecycle logs for `agent_started`, `tool_state`, `queue_changed`, and `settled`;
-- presents `assistant.text`, using the event correlation's channel;
-- presents the standard error text for `failed`;
-- never treats `queue_changed` as a source of prompt text.
-
-## Response presenter
-
-`src/presentation/response-presenter.ts` owns user-visible fallback text, per-channel send ordering, and bounded retry. Because it is the only production consumer of the retry clock, the injectable timing seam and its system implementation live in this module rather than a separate file.
+`index.ts` is only a composition root. `src/lifecycle.ts` provides early signal handling and one idempotent shutdown coordinator.
 
 ```ts
-export interface Clock {
-  sleep(delayMs: number): Promise<void>
+interface LifecycleResources {
+  marvin?: Pick<Marvin, 'closeAdmission'>
+  discord?: Pick<DiscordTransport, 'stopAccepting' | 'drain' | 'close' | 'destroy'>
+  assistant?: Pick<PiAssistant, 'close'>
 }
 
-const systemClock: Clock = {
-  sleep: (delayMs) => Bun.sleep(delayMs),
+interface LifecycleTestOptions {
+  deadlineMs?: number
+  hardExit?: (code: number) => never
+  setTimer?: typeof setTimeout
+  clearTimer?: typeof clearTimeout
 }
 
-export interface PresentRequest extends DiscordCorrelation {
-  text: string
-}
-
-export class ResponsePresenter implements PresenterPort {
-  constructor(
-    private readonly output: DiscordOutput,
-    private readonly logger: Logger,
-    private readonly clock: Clock = systemClock,
-    private readonly attempts = 3,
-  )
-
-  present(request: PresentRequest): Promise<void>
-  drain(): Promise<void>
+export class Lifecycle {
+  constructor(logger: Logger, options?: LifecycleTestOptions)
+  get closing(): boolean
+  installSignalHandlers(): void
+  runStartup(start: () => Promise<void>): Promise<void>
+  register(resources: Partial<LifecycleResources>): Promise<boolean>
+  fatal(reason: FailureReason, errorId: string): void
+  shutdown(reason: 'SIGINT' | 'SIGTERM' | 'fatal'): Promise<void>
 }
 ```
 
-`present` substitutes `I finished, but there was no text response.` when `text` is empty, calls `splitDiscordMessage`, and appends the send operation to a promise tail keyed by channel ID. Each chunk must finish before the next begins. A failed send uses backoff delays of 250 ms and 1,000 ms; after the third failure, it logs the source Discord message ID, chunk index, attempt, and a generated error ID, stops sending later chunks for that response, and resolves the channel tail so later control responses are not permanently blocked.
+`runStartup` tracks the complete asynchronous startup callback. It does not start the callback when shutdown has already begun, and shutdown waits for a running callback to settle within the same hard deadline.
 
-`drain` waits for existing channel tails during graceful shutdown. There is no replay file or cross-process delivery state.
+`register` merges optional resource slots after each successful construction step and returns `true`. If shutdown started while a resource was being constructed, `register` immediately cleans that late resource and returns `false`; the startup callback then returns without constructing later resources. The callback also checks `closing` after awaits that do not produce a registrable resource, such as configuration loading.
 
-## Discord message splitting
+`fatal` logs the supplied safe reason and error ID, then starts `shutdown('fatal')`; the bound method is passed directly to both `DiscordTransport.start` and `Marvin`. Timer and hard-exit functions are injectable only through the internal test options.
 
-`src/presentation/split-discord-message.ts` is a pure function:
-
-```ts
-export function splitDiscordMessage(
-  source: string,
-  limit = 2_000,
-): string[]
-```
-
-Required invariants:
-
-1. every returned chunk has length `<= limit`;
-2. after removing only the synthetic boundary fences, the remaining characters reproduce the source exactly and in order;
-3. chunks are non-empty unless the input itself is empty;
-4. a code fence open at a chunk boundary is synthetically closed at the end of that chunk and reopened at the start of the next;
-5. synthetic close/reopen text is included in the 2,000-character budget.
-
-The algorithm is line-aware:
+Startup order is:
 
 ```text
-while source remains
-  start with any synthetic reopening prefix and subtract it from the budget
-  scan source fence state (``` or ~~~, delimiter length, original info string)
-  reserve room for a synthetic closing fence when currently inside code
-  choose the largest source window that fits the remaining budget
-  move the break left, preferring:
-    1. paragraph boundary (blank line)
-    2. newline
-    3. whitespace
-    4. hard character boundary
-  never hard-split a UTF-16 surrogate pair
-  never split through a source fence delimiter when an earlier valid break exists
-  if the break is inside a fence:
-    append newline + matching closing delimiter
-    prefix the next chunk with the original opening fence line + newline
-  advance only by consumed source characters, never by synthetic wrappers
+create logger and Lifecycle synchronously
+install SIGINT/SIGTERM handlers with empty resource slots
+run the remaining steps through Lifecycle.runStartup
+  load configuration; return if closing
+  create and validate PiAssistant
+  register PiAssistant; return if registration reports closing
+  create DiscordTransport and Marvin
+  register Marvin and DiscordTransport; return if registration reports closing
+  subscribe Marvin to Pi outcomes
+  start Discord last; tolerate teardown rejection when closing
+  log ready only when still open
 ```
 
-Fence recognition follows Markdown's useful subset: up to three leading spaces, at least three matching backticks or tildes, and a closing delimiter using the same character with at least the opening length. The opening line, including its language/info suffix, is retained for synthetic reopening. If wrapper overhead leaves no room for one source character, the splitter hard-closes before the boundary and starts a fresh fenced chunk; it must always make progress.
+Installing signal handlers before asynchronous construction, tracking startup, and cleaning late registrations prevents a signal from completing shutdown while startup continues to create live resources.
 
-## Call-stack trees
-
-### Startup
+The first shutdown request:
 
 ```text
-index.ts
-  main()
-    PiRuntimeBridge.defaultSessionDir()
-      join(getAgentDir(), 'marvin', 'sessions')
-    loadConfig({ env: process.env, defaultSessionDir })
-      validate workspace/session directory/tools/limits
-    PiRuntimeBridge.create(config, logger)
-      create AgentSessionRuntime around continueRecent(...)
-      bind active AgentSession
-      validate diagnostics/model/auth/tool allowlist
-    new DiscordGateway(logger)
-    new ResponsePresenter(gateway, logger)
-    new ConversationController(...)
-    runtime.subscribe(controller.handleRuntimeEvent)
-    installSignalHandlers(shutdown)
-    gateway.start(token, controller.handleIngress, onFatal)
+mark shutdown started and arm a hard deadline
+Marvin.closeAdmission()
+DiscordTransport.stopAccepting()
+PiAssistant.close()
+DiscordTransport.drain()
+DiscordTransport.close()
+await tracked startup settlement and any late-resource cleanup
+clear the hard deadline
+set the process exit status
 ```
 
-Discord login is last. Any earlier failure disposes the partially created runtime, writes one metadata-only startup event, sets a non-zero exit code, and never connects the bot.
+Each cleanup step is attempted even if an earlier one fails. The hard deadline calls `DiscordTransport.destroy()` when available and then invokes the injected hard-exit function rather than merely setting `process.exitCode`. A second signal uses the same immediate hard-exit path. The deadline timer is cleared after successful cleanup.
 
-### First prompt and response
+## Required Pi contract checks
 
-```text
-Discord MessageCreate
-  DiscordGateway.toIngress
-    ConversationController.handleIngress(prompt)
-      parseControlCommand -> undefined
-      runtime.getStatus -> idle
-      PiRuntimeBridge.startPrompt(prompt)
-        session.prompt(text, preflightResult)
-          Pi agent/tool loop
-          message_end(toolUse) -> ignored
-          message_end(stop)
-            classifyAssistantMessage
-            RuntimeEvent.assistant
-              ConversationController.handleRuntimeEvent
-                ResponsePresenter.present
-                  splitDiscordMessage
-                  send chunks serially with bounded retry
-```
+`tests/pi-contract.test.ts` is mandatory and uses a temporary session directory plus a fake/local provider without user credentials or external network access. It verifies the assumptions most likely to change between SDK versions:
 
-### Prompt received while running
+- Bun can import and construct the exactly pinned Pi version;
+- prompt preflight resolves before the complete model run;
+- session streaming state is observable after prompt acceptance and until settlement;
+- preflight rejections become admission failures without retaining prompt text;
+- admission while streaming returns busy without forwarding or retaining prompt text;
+- `length` responses containing tool calls continue rather than becoming final output;
+- terminal answer, retry, failure, and abort event sequences match the reducer;
+- shutdown abort reaches settlement;
+- abort terminates Pi-managed foreground shell processes before settlement;
+- continuing the most recent usable session follows Pi's persistence behavior; and
+- effective settings, resources, packages, model, authentication, and tools match application policy.
 
-```diff
- Discord MessageCreate
-   ConversationController.handleIngress(prompt)
--    runtime.getStatus -> idle
--    runtime.startPrompt(prompt)
-+    runtime.getStatus -> running; N queued
-+    if N == maxPending
-+      presenter.present(queue-full message)
-+    else
-+      runtime.queueFollowUp(prompt)
-+        session.followUp(text)
-+      presenter.present(queue-position acknowledgement)
-```
-
-When Pi later promotes that follow-up, its user `message_start` advances correlation metadata. No controller callback calls `session.prompt()` for queued text.
-
-### Stop and new conversation
-
-```text
-handleIngress(!stop)
-  phase = stopping
-  runtime.stop('stop')
-    suppress abort outcome
-    session.clearQueue()
-    clear correlation metadata
-    await session.abort()
-  phase = ready
-  presenter.present({ ...commandCorrelation, text: "Stopped." })
-
-handleIngress(!new)
-  phase = resetting
-  runtime.newConversation()
-    runtime.stop('new')
-    runtime.newSession()
-      recreate cwd-bound Pi services/session
-      bindSession(new session)
-  phase = ready
-  presenter.present({ ...commandCorrelation, text: "Started a new conversation." })
-```
-
-### Bounded shutdown
-
-```text
-SIGINT / SIGTERM
-  shutdown(reason)                     # idempotent
-    controller.beginShutdown()
-    gateway.stopAccepting()
-    runtime.stop('shutdown')
-    presenter.drain()
-    runtime.dispose()
-    gateway.close()
-  race cleanup against 10-second timeout
-  set process.exitCode
-```
-
-A second signal during shutdown may terminate immediately. Shutdown errors are reduced to operation name plus error ID; cleanup continues through all remaining steps.
-
-## Concurrency and ownership invariants
-
-- Exactly one `AgentSessionRuntime`, one active bound `AgentSession`, and one Discord client exist.
-- Only `PiRuntimeBridge` invokes `prompt`, `followUp`, `clearQueue`, `abort`, `newSession`, or `dispose`.
-- The controller never awaits the full prompt completion while holding its admission critical section.
-- Pi is the sole owner of queued prompt text. Marvin's correlation FIFO contains IDs only.
-- Session replacement occurs only after queue clear and abort settlement.
-- A raw Pi callback never awaits Discord network I/O; it emits a reduced application event, and the presenter owns outbound ordering.
-- Outbound chunks for one channel never overlap.
-- Session subscriptions and signal handlers each have explicit disposal.
-- No public response or log contains provider error details, tool arguments/results, thinking content, shell commands, tokens, or credentials.
+If these checks cannot be implemented against `0.82.1`, dependency selection and this document must be updated before application code proceeds.
 
 ## Test design
 
-Tests use Bun's test runner and dependency fakes; they do not connect to Discord or a model provider.
+Tests use Bun's test runner and injected factories/functions. They do not connect to Discord or a paid model provider.
 
-| Test file | Required coverage |
+| Test | Primary coverage |
 | --- | --- |
-| `config.test.ts` | missing secrets, canonical workspace, private/default session dir, invalid integers, unknown/duplicate tools, mandatory `bash`, blank model selector |
-| `control-command.test.ts` | whitespace/case handling, exact commands, near-misses remain prompts |
-| `discord-gateway.test.ts` | bot/non-DM/group-DM/empty filtering, attachment-only mapping, original text preservation, safe outbound options, ingress rejection catch |
-| `pi-event-mapper.test.ts` | tool-use suppression, ordered text extraction, thinking exclusion, empty answer, length answer, retryable versus terminal error, aborted result |
-| `pi-runtime-bridge.test.ts` | prompt preflight boundary, follow-up position, ID-only correlation order, queue clear, retry failure timing, stale event suppression, session rebind/fatal replacement failure |
-| `conversation-controller.test.ts` | idle prompt admission, follow-up admission, queue limit, status text, transition rejection, stop order, reset/rebind behavior, stale-session event rejection, attachment-only response |
-| `split-discord-message.test.ts` | 0/1/2,000/2,001 chars, paragraph/newline/space/hard breaks, surrogate pairs, long unbroken text, backtick and tilde fences, long fence info, source fences at boundaries, every chunk within limit, source preservation |
-| `response-presenter.test.ts` | empty fallback, sequential chunks, retry delays, stop-after-terminal-chunk-failure, later response not deadlocked |
-| `lifecycle.test.ts` | Discord-login-last startup, idempotent shutdown order, drain, timeout, second-signal behavior, partial-startup cleanup |
+| `config.test.ts` | Missing values, canonical directories, permissions, optional model. |
+| `discord.test.ts` | Bot/non-DM/group filtering, attachment-only input, original text, safe mentions, serialized chunks, send failure recovery, listener catches. |
+| `split-message.test.ts` | Invalid limits, empty and boundary lengths, preferred breaks, long unbroken text, surrogate pairs, length and source-preservation properties. |
+| `marvin.test.ts` | All text forwarded unchanged, started/busy/unavailable/failure results, closed feedback, and fatal outcomes. |
+| `pi.test.ts` | Atomic admission, busy rejection without text retention, preflight rejection mapping, event reduction, failure handling, and close exclusion. |
+| `pi-contract.test.ts` | Real pinned-SDK behavior listed above. |
+| `lifecycle.test.ts` | Discord-login-last startup, signal during each startup await, late-resource cleanup, reasoned fatal callback wiring, partial cleanup, idempotent shutdown, cleanup failures, destroy-on-deadline, second signal. |
 
-`tests/support/fakes.ts` provides:
-
-```ts
-export class FakeRuntimeBridge { /* controllable status/events/call order */ }
-export class FakeDiscordOutput { /* sent messages and injected failures */ }
-export class FakeLogger { /* typed LogEvent[] only */ }
-export class FakeClock { /* controllable retry delays */ }
-```
-
-One local smoke test may instantiate the real Pi bridge with an in-memory/fake provider and a temporary session directory to prove rebinding and correlation ordering, but the unit suite must not depend on the user's Pi credentials or session files.
-
-## Explicit boundaries
-
-- This design follows the accepted architecture decision to trust Discord application visibility as the user boundary. It does not add `MARVIN_USER_ID`; changing back to an explicit user allowlist requires an architecture update first.
-- `MARVIN_WORKSPACE` sets Pi's working directory but is not a sandbox. No TypeScript abstraction attempts to enforce filesystem containment over `bash`.
-- Attachments, streaming token edits, durable Pi follow-ups, durable Discord outbox/replay, multiple users, multiple DM sessions, guild channels, and arbitrary Pi extensions are out of scope.
-- Pi JSONL remains opaque to Marvin. No module parses, patches, mirrors, or indexes session files.
-- This is a program-design document, not the vertical-slice implementation plan.
-
----
-
-This document follows the program-design guidance in [Why Software Factories Fail](https://github.com/humanlayer/advanced-context-engineering-for-coding-agents/blob/main/wsff.md#program-design): align on file layout, types, method signatures, and call stacks before implementation.
+`tests/support.ts` contains only shared fakes that are used by more than one test file.

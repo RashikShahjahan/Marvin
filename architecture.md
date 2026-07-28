@@ -1,306 +1,215 @@
 # Marvin System Architecture
 
 **Status:** Proposed for the first release  
-**Scope:** Service boundaries, event contracts, state, and runtime flows. File layout, types, and function signatures belong in a separate program-design document.
+**Scope:** Runtime boundaries, state ownership, persistence, and externally visible behavior. TypeScript modules and SDK calls belong in [`program-design.md`](./program-design.md).
 
-## Goals and constraints
+## Goals
 
 Marvin is a personal AI assistant reached through Discord direct messages. The first release must:
 
-- serve the sole Discord user who can see and message the bot;
-- preserve conversational context across process restarts;
-- run agentic tasks with shell access;
-- acknowledge work promptly and expose running, queued, stopped, and failed states;
-- deliver responses without losing text at Discord's message-size boundary; and
-- remain simple to run as a personal, single-host service.
+- serve the sole user who can see and message the private Discord application;
+- preserve completed conversational context across process restarts;
+- run agentic tasks with approved tools, including shell access;
+- process only one request at a time and reject overlapping requests;
+- expose accepted, busy, and failed outcomes promptly;
+- deliver long responses without losing source text at Discord's message limit; and
+- remain simple to run as a single-host personal service.
 
 ## Architecture decisions
 
-1. **One Bun process.** The Discord adapter, conversation controller, and Pi agent runtime run in the same process. There is no HTTP API, worker service, broker, or database.
-2. **Pi SDK for the agent runtime.** Marvin embeds `@earendil-works/pi-coding-agent` and uses `AgentSessionRuntime` for prompting, cancellation, and clean-session replacement.
-3. **Pi JSONL is the only persistent conversation store.** `SessionManager` owns session creation, append-only message history, compaction, and restoration.
-4. **One user, one active conversation.** The bot is visible to one Discord user, and that user's DM maps to one active Pi session. `!new` starts a fresh session while retaining prior JSONL files.
-5. **Pi owns message queueing.** The first prompt starts with `session.prompt(...)`; additional prompts received while Pi is streaming use `session.followUp(...)`. Pi delivers follow-ups one at a time and exposes queue state through `queue_update` and `pendingMessageCount`. Marvin does not maintain a parallel prompt FIFO. Pi's pending queue is intentionally not durable in the first release.
-6. **Shell isolation is an operating-system boundary.** Pi's `bash` tool runs with the Marvin process's permissions. A configured working directory limits default command location, not filesystem authority; Marvin must run as a dedicated, non-root user or in a container with only intended resources mounted.
+1. **One Bun process.** Marvin has no HTTP API, worker service, broker, or application database.
+2. **Discord visibility is the user boundary.** The application is private and visible only to the sole user. Marvin validates event shape but keeps no second user-ID allowlist.
+3. **Pi owns the agent and conversation history.** Marvin embeds `@earendil-works/pi-coding-agent`; Pi's native JSONL sessions are the only conversation store.
+4. **One continuing conversation.** Marvin resumes the most recent usable Pi session and exposes no conversation-switching control.
+5. **No prompt queue.** Marvin starts a prompt only while Pi is idle. A prompt received while Pi is running is rejected as busy without being forwarded or retained.
+6. **In-flight work is volatile.** A process exit may lose it.
+7. **Discord delivery is best effort.** Marvin preserves text and order during normal delivery but has no durable outbox or exactly-once guarantee.
+8. **Shell isolation is an operating-system boundary.** A working directory is not a sandbox. Marvin must run as a dedicated non-root identity or in a suitably restricted container.
 
 ## System context
 
 ```mermaid
 flowchart LR
-  User[Sole Discord user] <-->|Discord DM| Discord[Discord Gateway API]
-  Provider[Configured LLM provider]
-  Files[(Pi session JSONL)]
-  Host[Host filesystem and commands]
+  User[Sole Discord user] <-->|Private DM| Discord[Discord Gateway API]
+  Provider[Configured model provider]
+  Sessions[(Pi JSONL sessions)]
+  Host[Host files and commands]
 
-  subgraph Process[Single Marvin Bun process]
-    Adapter[Discord adapter]
-    Controller[Conversation controller]
-    Presenter[Response presenter]
-    Pi[Pi SDK runtime and built-in queue]
+  subgraph Process[One Marvin Bun process]
+    Transport[Discord transport]
+    App[Marvin application]
+    Pi[Pi assistant]
+    Lifecycle[Bootstrap and lifecycle]
 
-    Adapter --> Controller
-    Controller --> Pi
-    Pi --> Presenter
-    Presenter --> Adapter
+    Transport --> App
+    App --> Pi
+    Pi --> App
+    App --> Transport
+    Lifecycle --> Transport
+    Lifecycle --> Pi
   end
 
-  Discord <--> Adapter
+  Discord <--> Transport
   Pi <--> Provider
-  Pi <--> Files
-  Pi -->|Pi tools, including bash| Host
+  Pi <--> Sessions
+  Pi -->|Approved tools| Host
 ```
 
-Discord's Gateway API and the selected model provider are Marvin's only required network integrations. Shell commands inherit whatever network access the OS or container grants. Marvin opens no inbound network port.
+Discord and the configured model provider are the only required network integrations. Shell commands inherit any network access granted by the deployment environment. Marvin opens no inbound network port.
 
-## Component responsibilities
+## Responsibilities
 
 | Component | Responsibility |
 | --- | --- |
-| Bootstrap and configuration | Validate secrets, workspace, model availability, tool allowlist, and session directory before connecting to Discord. |
-| Discord adapter | Accept non-bot text DMs, convert Discord events into internal events, and send acknowledgements, control responses, and ordered response chunks. |
-| Conversation controller | Interpret local control commands, route idle input to `prompt` and streaming input to `followUp`, enforce queue admission limits, and coordinate abort/new-session transitions. |
-| Pi runtime bridge | Own the active `AgentSessionRuntime` and its built-in follow-up queue; subscribe to lifecycle, message, tool, and queue events; clear/abort work; and replace sessions. |
-| Pi `SessionManager` | Continue the latest session at startup and persist Pi's native versioned JSONL session entries. |
-| Response presenter | Extract final assistant text, split it into valid Discord messages, preserve ordering, and suppress unwanted mentions. |
-| Structured logger | Write metadata-only lifecycle and error events to stdout; never log prompts, response bodies, shell commands, tool output, tokens, or credentials. |
+| Bootstrap and lifecycle | Validate configuration, create Pi before Discord login, install signal handling, and perform bounded shutdown. |
+| Discord transport | Accept valid one-to-one text DMs, ignore unsupported events, serialize outgoing responses, split long text, and disable mention expansion. |
+| Marvin application | Route prompts, format acknowledgements and safe failures, and connect Pi outcomes to the sole output destination. |
+| Pi assistant | Own the active runtime and session, atomically admit one prompt at a time, reduce raw Pi events, handle terminal failures, and close cleanly. |
 
-## Ingress and control contracts
+These are responsibility boundaries, not separate services. Logging and message splitting are small implementation utilities rather than architectural components.
 
-### Accepted Discord event
+## Discord ingress
 
-Marvin consumes `MessageCreate` events. Discord application visibility is trusted as the user boundary; the adapter only validates the event shape:
+Marvin consumes Discord `MessageCreate` events. An event is accepted only when:
 
 ```text
 author.bot       = false
-channel.type     = DM
+channel.type     = one-to-one DM
 content.trim()   is non-empty
 ```
 
-Bot-authored or non-DM events are ignored. Attachment-only messages receive a short "text only" response; attachments are not sent to the model in the first release.
+Application visibility is trusted to ensure that an accepted DM belongs to the sole user. Guild messages, group DMs, bot messages, and empty messages are ignored. An attachment-only message receives a short text-only response. When a message contains both text and attachments, only its text is processed.
 
-After validation, the adapter produces this logical event:
+Discord message IDs may be retained briefly for transport deduplication or logging, but they are not conversation state. Because every accepted message has the same output destination, Pi outcomes do not carry per-prompt Discord correlation objects.
 
-```json
-{
-  "type": "user.prompt",
-  "discord_message_id": "string",
-  "discord_channel_id": "string",
-  "text": "string",
-  "received_at": "ISO-8601 timestamp"
-}
-```
+## Prompt admission
 
-Discord IDs are correlation metadata only. They are not a second conversation store.
-
-### Local control messages
-
-Control messages are handled before queueing and are not forwarded to Pi:
-
-| Message | Contract |
-| --- | --- |
-| `!stop` | Call `session.clearQueue()`, abort the active Pi run, suppress its partial answer, and reply `Stopped.` once the runtime is idle. No-op safely when already idle. |
-| `!new` | Clear Pi's queue, abort and await any active run, create a new persistent Pi session, rebind session event subscriptions, and acknowledge the new conversation. Old JSONL sessions remain available. |
-| `!status` | Derive and return `idle`, `running`, or `running; N queued` from Pi's session state without changing it. |
-
-The control path bypasses Pi's follow-up queue but is serialized by the conversation controller so a session cannot be replaced during an active write.
-
-### Agent completion
-
-The Pi bridge emits these logical outcomes to the controller as Pi messages and lifecycle events arrive:
+Inspection of Pi's current state and the corresponding operation form one atomic admission decision:
 
 ```text
-assistant { session_id, text }
-stopped   { session_id }
-failed    { session_id, public_error, error_id }
+idle                -> start Pi prompt; acknowledge Working.
+running             -> reject without retaining text; report busy.
+shutting down       -> reject; report temporarily unavailable.
 ```
 
-Provider details, stack traces, and tool output never appear in `public_error`.
+State inspection and prompt start are serialized so concurrent Discord events cannot both observe Pi as idle. Marvin never calls Pi's follow-up APIs. Text rejected while Pi is running remains available only in Discord history and must be sent again after the active request finishes.
 
-## Pi SDK boundary
+## Runtime state
 
-Marvin creates an `AgentSessionRuntime` with:
-
-- `cwd` set to the validated Marvin workspace;
-- `SessionManager.continueRecent(workspace, sessionDirectory)` at startup;
-- Pi's standard `AuthStorage`, `ModelRegistry`, and settings/model resolution;
-- an application-owned system prompt suitable for a Discord assistant;
-- an explicit tool allowlist that includes `bash` and only the approved supporting tools;
-- Pi's `followUpMode` fixed to `one-at-a-time`; and
-- Pi compaction and retry behavior from validated Pi settings.
-
-The default supporting-tool set is `read`, `bash`, `grep`, `find`, and `ls`. Omitting `edit` and `write` is not a security boundary because shell commands can still mutate files. Filesystem and process restrictions must be enforced by the deployment environment.
-
-Marvin consumes Pi events as follows:
-
-| Pi event | Marvin behavior |
-| --- | --- |
-| `agent_start` | Mark the session running. |
-| `queue_update` | Derive queue depth and status from `followUp.length`; never log the queued text. |
-| user `message_start` | Observe when Pi promotes the oldest follow-up into the active turn. |
-| `tool_execution_start/end` | Emit metadata-only telemetry. |
-| `message_update` | Do not post partial Discord messages; wait for a complete response. |
-| terminal assistant `message_end` | Publish the completed answer for that one-at-a-time turn. |
-| `agent_end` | Observe the run boundary and retry state; do not treat it as the only response event. |
-| `agent_settled` | Mark the session idle. |
-| aborted/error result | Suppress partial text for an explicit stop; otherwise produce a concise failure. |
-
-When Pi is idle, Marvin calls `session.prompt(text)`. While Pi is streaming, Marvin calls `session.followUp(text)`; Pi queues and drains those messages in order under `one-at-a-time` mode. Queue admission and `!status` read `session.pendingMessageCount` or `queue_update` counts. Marvin keeps no second copy of queued prompt text.
-
-## Primary flows
-
-### User prompt
-
-```mermaid
-sequenceDiagram
-  actor User as Sole user
-  participant Discord
-  participant Adapter as Discord adapter
-  participant Controller as Conversation controller
-  participant Pi as Pi SDK runtime
-  participant Session as Pi JSONL session
-  participant Model as Model/tools
-
-  User->>Discord: Send DM
-  Discord->>Adapter: MessageCreate
-  Adapter->>Adapter: Validate text DM event
-  Adapter->>Controller: user.prompt
-  alt Pi is idle
-    Controller->>Pi: session.prompt(text)
-  else Pi is streaming
-    Controller->>Pi: session.followUp(text)
-    Pi-->>Controller: queue_update
-    Controller-->>Discord: Report Pi follow-up queue position
-  end
-  Pi->>Session: Append user entry when Pi delivers the message
-  Pi->>Model: Model calls and approved tool execution
-  Model-->>Pi: Final result
-  Pi->>Session: Append assistant/tool entries
-  Pi-->>Controller: terminal assistant message_end
-  Controller->>Adapter: Present response
-  Adapter->>Discord: Ordered chunks, each <= 2,000 characters
-  Discord-->>User: Complete response
-```
-
-If a prompt arrives while Pi is running, `session.followUp(...)` adds it to Pi's queue and Marvin immediately reports the resulting position. In `one-at-a-time` mode, Pi promotes the oldest follow-up only after the current agent turn would otherwise stop, then waits for its response before promoting another.
-
-### Stop and reset
-
-```mermaid
-sequenceDiagram
-  actor User as Sole user
-  participant Controller as Conversation controller
-  participant Pi as Pi SDK runtime
-  participant Session as Pi JSONL sessions
-  participant Discord
-
-  User->>Controller: !stop
-  Controller->>Pi: session.clearQueue()
-  Controller->>Pi: abort active run
-  Pi-->>Controller: agent_settled
-  Controller-->>Discord: Stopped.
-
-  User->>Controller: !new
-  Controller->>Pi: session.clearQueue()
-  Controller->>Pi: abort and await idle if needed
-  Controller->>Pi: runtime.newSession()
-  Pi->>Session: Create new JSONL session
-  Controller->>Controller: Rebind session subscription
-  Controller-->>Discord: Started a new conversation.
-```
-
-## Persistence model
-
-Pi's session format is authoritative. Files live in the configured session directory and contain versioned JSONL entries. The following lines show only the fields relevant to this architecture; Pi writes the complete native message schema:
-
-```json
-{"type":"session","version":3,"id":"uuid","timestamp":"ISO-8601","cwd":"/configured/workspace"}
-{"type":"message","id":"entry-id","parentId":null,"timestamp":"ISO-8601","message":{"role":"user","content":"..."}}
-{"type":"message","id":"entry-id","parentId":"entry-id","timestamp":"ISO-8601","message":{"role":"assistant","content":[{"type":"text","text":"..."}],"stopReason":"stop"}}
-```
-
-The actual schema, tree links, tool results, model changes, and compaction entries remain Pi-owned. Marvin must use `SessionManager` APIs rather than parsing or editing session files directly.
-
-Persistence rules:
-
-- Startup continues the most recently modified Marvin session, or creates one when none exists.
-- `!new` changes the active session; it does not delete history.
-- Completed Pi entries survive process restarts. Pi's pending follow-up queue and an in-flight Discord delivery do not.
-- The session directory must be private to the Marvin OS account and included in backups according to the user's needs.
-- Session files contain prompts, responses, shell calls, and tool output and must be treated as sensitive data.
-
-## Pi queue and lifecycle state
-
-Pi owns both the active run and queued follow-ups. Marvin derives externally meaningful state from `session.isStreaming`, `session.pendingMessageCount`, `queue_update`, and `agent_settled`:
+Externally meaningful state is deliberately small:
 
 ```mermaid
 stateDiagram-v2
   [*] --> Idle
-  Idle --> Streaming: session.prompt
-  Streaming --> Streaming: session.followUp queues input
-  Streaming --> Stopping: !stop or !new
-  Stopping --> Idle: clearQueue + abort settled
-  Streaming --> Idle: agent_settled
-  Idle --> Resetting: !new
-  Stopping --> Resetting: !new after abort
-  Resetting --> Idle: new Pi session ready
+  Idle --> Running: accepted prompt
+  Running --> Idle: answer or request failure
+  Idle --> Closing: shutdown
+  Running --> Closing: shutdown
 ```
 
-Queue contract:
+The Pi assistant owns the operation guard so concurrent prompts cannot both start and prompt admission cannot race shutdown.
 
-```text
-idle                         -> session.prompt(text)
-streaming and below limit    -> session.followUp(text)
-streaming and at limit       -> reject new input with retry-later feedback
-!stop or !new                -> session.clearQueue(), then session.abort()
-status                       -> session.isStreaming + session.pendingMessageCount
+## Primary flow
+
+```mermaid
+sequenceDiagram
+  actor User
+  participant Discord
+  participant Transport as Discord transport
+  participant App as Marvin application
+  participant Pi as Pi assistant
+  participant Store as Pi JSONL
+  participant Model as Model and tools
+
+  User->>Discord: Send text DM
+  Discord->>Transport: MessageCreate
+  Transport->>App: Accepted text
+  App->>Pi: Admit prompt
+  alt Pi idle
+    Pi-->>App: Started
+    App-->>Transport: Working.
+    Pi->>Store: Persist native session entries
+    Pi->>Model: Model and approved tool calls
+    Model-->>Pi: Results
+    Pi-->>App: Final text or safe failure category
+    App->>Transport: User-visible response
+    Transport->>Discord: Ordered chunks
+    Discord-->>User: Complete response text
+  else Pi running
+    Pi-->>App: Busy
+    App-->>Transport: Busy response; request not retained
+  else Shutting down
+    Pi-->>App: Unavailable
+    App-->>Transport: Retry-later response
+  else Admission failed
+    Pi-->>App: Safe failure, possibly fatal
+    App-->>Transport: Not-accepted response
+  end
 ```
 
-The admission limit guards Pi's queue but does not create a second queue. Pi holds pending follow-up text in memory and persists a user message to JSONL only when that message is delivered into a turn, so undelivered follow-ups are lost on restart. A deployment must run only one Marvin process for a given Discord token and session directory; concurrent writers are unsupported.
+Raw model deltas, thinking blocks, tool arguments, tool output, and provider errors remain inside the Pi boundary. Only final assistant text, admission outcomes, and safe failure categories reach the application.
 
-## Discord response contract
+## Failure handling and shutdown
 
-- If work is already active, call `session.followUp(...)` and acknowledge the position reported by Pi's resulting queue state.
-- Do not stream token deltas into Discord; publish only the completed answer.
-- Split output into chunks of at most 2,000 characters, preferring paragraph, newline, then whitespace boundaries before a hard split.
-- Preserve all text and balance/reopen Markdown code fences across chunk boundaries.
-- Send chunks sequentially and disable automatic user/role/everyone mentions.
-- If Pi returns no user-visible text, send a concise fallback rather than an empty Discord message.
+A terminal request failure emits one safe failure outcome and returns the assistant to idle after Pi settles. There is no pending prompt work to recover or discard.
+
+Graceful shutdown prevents new admission, aborts active work, awaits Pi settlement, and disposes the runtime. Detached processes remain unsupported.
+
+## Persistence
+
+Pi's native session format is authoritative and opaque to Marvin. Marvin uses Pi APIs to continue the most recent usable session; it does not parse, patch, mirror, or index JSONL entries.
+
+- Completed Pi entries survive restarts according to Pi's persistence behavior.
+- Active work and in-flight Discord delivery are not persistent.
+- Session files contain prompts, responses, shell calls, and tool output and must be treated as sensitive.
+- Only one Marvin process may use a Discord token and session directory at a time.
+
+## Discord output
+
+- Serialize complete logical responses so chunks and acknowledgements do not interleave.
+- Split text into chunks of at most 2,000 UTF-16 code units.
+- Prefer paragraph, newline, then whitespace boundaries before a hard split.
+- Preserve every source character in order and avoid splitting a UTF-16 surrogate pair.
+- Do not synthesize or rebalance Markdown fences in the first release.
+- Disable automatic user, role, and everyone mentions on every send.
+- Substitute a concise fallback when Pi returns no visible text.
+
+The Discord SDK owns rate-limit handling. Marvin does not maintain a durable replay buffer. A terminal send failure is logged with safe metadata and may leave a response partially delivered.
 
 ## Failure behavior
 
 | Failure | Required behavior |
 | --- | --- |
-| Missing/invalid configuration, unavailable model credentials, invalid workspace, or unreadable latest session | Fail closed before Discord login with an actionable metadata-only startup error. Do not silently start a blank conversation after a session error. |
-| Model or tool failure | Let Pi apply its configured retry policy, persist whatever Pi records, and send a concise failure with an error ID after a terminal error. Follow-up delivery remains owned by Pi; Marvin does not recover through a second queue. |
-| Explicit `!stop` | Call `session.clearQueue()` before aborting, suppress partial assistant text, and acknowledge only after Pi emits `agent_settled`. |
-| Discord send failure | Retry a small bounded number of times with backoff; log the message ID, chunk index, and error ID. There is no durable outbound replay in v1. |
-| Process termination | Stop accepting events, call `session.clearQueue()`, abort/settle Pi, dispose the runtime, and close the Discord client within a bounded shutdown window. |
-| Process crash | On restart, continue the latest valid Pi session. Do not attempt to infer or replay prompts that were only in memory. |
+| Invalid configuration, unavailable credentials/model, or unusable workspace/session directory | Fail before Discord login with a safe actionable reason code. |
+| Prompt received while Pi is running | Reject it as busy without forwarding or retaining its text. |
+| Model or tool failure | Allow configured Pi retries, then report the failure and return to idle. |
+| Prompt admission failure | Report that the request was not accepted and do not retain its text. A fatal failure closes Pi and begins shutdown instead of suggesting a retry. |
+| Fatal Pi runtime failure | Send a safe failure if possible and begin shutdown. |
+| Discord send failure | Log safe metadata; do not replay after process restart. |
+| Graceful termination | Stop ingress, abort and dispose Pi's runtime, drain already-scheduled sends, and close Discord within a deadline. |
+| Process crash | Continue the most recent usable persisted Pi session; do not infer or replay volatile work. |
 
-## Configuration contract
+Safe reason codes must be specific enough to guide remediation without exposing prompts, paths, provider messages, credentials, shell commands, or tool output.
+
+## Configuration
 
 | Setting | Required | Purpose |
 | --- | --- | --- |
-| `DISCORD_TOKEN` | Yes | Discord bot credential; secret and never logged. |
-| `MARVIN_WORKSPACE` | Yes | Existing absolute directory used as Pi's `cwd` and the shell's starting directory. |
-| `MARVIN_SESSION_DIR` | No | Dedicated directory for Pi JSONL sessions; defaults beneath Pi's agent directory, isolated from ordinary CLI sessions. |
-| `MARVIN_MODEL` | No | Optional Pi model/thinking selection. If absent, use Pi's normal settings and available-model resolution. |
-| `MARVIN_TOOLS` | No | Explicit approved Pi tool names; defaults to the supporting-tool set above. Unknown tools fail startup. |
-| `MARVIN_MAX_PENDING` | No | Maximum accepted Pi follow-ups while streaming. Admission uses `pendingMessageCount`; no Marvin-owned prompt queue is created. |
+| `DISCORD_TOKEN` | Yes | Private Discord bot credential. |
+| `MARVIN_WORKSPACE` | Yes | Existing absolute directory used as Pi's working directory. |
+| `MARVIN_SESSION_DIR` | No | Private directory for Marvin's Pi sessions. |
+| `MARVIN_MODEL` | No | Optional exact model and thinking selection. |
 
-Pi provider credentials, custom model definitions, and settings stay in Pi's standard auth/model/settings mechanisms rather than being copied into Marvin configuration.
+The approved Pi tools are fixed application policy for the first release rather than environment configuration. Pi provider credentials remain in Pi's standard credential mechanism.
 
-## Security and privacy boundaries
+## Security and privacy
 
-1. Trust Discord's private application visibility as the user boundary.
-2. Use only direct-message intents; do not request guild-message behavior for this product.
-3. Disable mention expansion on every outbound message.
-4. Run Marvin as a dedicated, non-root OS identity. Restrict its readable files, environment variables, executable paths, network access, and mounted workspace to what the assistant is intended to use.
-5. Treat `MARVIN_WORKSPACE` as a convenience and context boundary, not a sandbox. The `bash` tool can address paths outside it whenever the OS allows.
-6. Keep the Discord token and model credentials out of source control and session files.
-7. Protect and back up the session directory as sensitive personal data; do not duplicate transcript content into operational logs.
-8. Load only application-approved Pi tools/resources. Arbitrary extensions execute inside the Marvin process and therefore require the same trust as application code.
-
----
-
-This document follows the system-architecture guidance in [Why Software Factories Fail](https://github.com/humanlayer/advanced-context-engineering-for-coding-agents/blob/main/wsff.md#system-architecture): align on services, event contracts, schemas, queues, stores, and their interactions before moving into program design.
+1. Keep the Discord application private and visible only to the sole user.
+2. Accept only one-to-one DMs and never request guild-message behavior.
+3. Disable mention expansion on all outbound messages.
+4. Run Marvin as a dedicated non-root OS identity or in a restricted container.
+5. Treat the workspace as a starting location, not a filesystem sandbox.
+6. Use a fixed built-in tool allowlist and prevent unapproved Pi extensions, packages, skills, prompts, or project settings from becoming executable resources.
+7. Keep Discord and provider credentials out of source control and session files.
+8. Protect and back up the session directory as sensitive personal data.
+9. Never log prompts, response bodies, thinking, shell commands, tool arguments/results, tokens, or credentials.
