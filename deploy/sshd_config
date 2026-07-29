@@ -1,0 +1,19 @@
+# Include from the global section of sshd_config after installing the launcher.
+PermitUserEnvironment no
+
+Match User marvin
+    PubkeyAuthentication yes
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+    AuthorizedKeysCommand none
+    TrustedUserCAKeys none
+    PermitTTY yes
+    ForceCommand /opt/marvin/bin/marvin
+    DisableForwarding yes
+    PermitUserRC no
+    ClientAliveInterval 30
+    ClientAliveCountMax 2
+
+Match all

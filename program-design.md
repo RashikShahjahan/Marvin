@@ -2,374 +2,262 @@
 
 **Status:** Proposed for the first release  
 **Inputs:** [`product.md`](./product.md) and [`architecture.md`](./architecture.md)  
-**Scope:** TypeScript/Bun modules, application-facing interfaces, control flow, and tests.
+**Scope:** Launcher files, exact Pi invocation, deployment policy, and verification.
 
 ## Design summary
 
-Marvin is one Bun process with two external adapters: Discord and Pi. A small application object connects them, and `index.ts` starts them directly.
+Marvin is a small foreground launcher around Pi's native interactive CLI. It has no TypeScript application runtime, Discord adapter, Pi SDK integration, prompt queue, event reducer, renderer, or application database.
 
-The design deliberately uses the product's strongest simplifying invariant: every accepted prompt and every response belongs to one private Discord user. There is one output destination, so Marvin does not carry Discord correlation objects through the Pi runtime or maintain per-channel output state.
+The launcher does only five things:
 
-The central decisions are:
+1. validate the SSH terminal and deterministic local configuration;
+2. acquire one non-blocking instance lock;
+3. change to Marvin's workspace;
+4. run the exactly pinned Pi CLI with fixed base-prompt, tool, and session arguments; and
+5. replace itself with Pi while transferring the open lock descriptor.
 
-1. Pin the Pi and Discord dependencies exactly and verify Pi's runtime contract with an integration test before relying on version-specific APIs.
-2. Keep all Pi imports and raw Pi events in one module.
-3. Expose one atomic `admit()` operation that starts work only while Pi is idle and reports busy otherwise.
-4. Do not buffer prompts; text received while Pi is running is neither forwarded nor retained.
-5. Send Discord responses immediately, without ordering concurrent sends.
-6. Terminate the process directly after a fatal runtime or transport failure.
-7. Use small structural dependency types and injected functions for tests rather than a global domain module or general port hierarchy.
+Everything after Pi starts is Pi-native. This is the smallest design that preserves SSH access, conversational continuity, agent tools, steering and follow-up queues, ordered terminal output, and visible request failures.
 
-## Dependencies
+## Host contract
 
-Runtime dependencies are pinned because the design depends on concrete SDK event behavior:
+The first release targets one Linux SSH host with:
+
+- OpenSSH or an equivalent server that supports a forced command and PTY allocation;
+- a POSIX shell;
+- util-linux `flock(1)` with non-blocking descriptor locks on a local filesystem;
+- Node.js `>=22.19.0`, required by the pinned Pi package; and
+- Bun for frozen dependency installation and repository scripts.
+
+Desktop and mobile clients need only a compatible SSH terminal. Host portability beyond this contract is not a first-release feature; a different host must provide equivalent descriptor-lock and `exec` behavior and pass the same acceptance suite.
+
+## Dependency
+
+Pi is the only application dependency:
 
 ```json
 {
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.82.1",
-    "discord.js": "14.26.4"
+    "@earendil-works/pi-coding-agent": "0.82.1"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   }
 }
 ```
 
-An upgrade is a deliberate change that must pass the Pi contract suite. The Bun lockfile remains committed.
+The exact version and `bun.lock` are committed. The launcher invokes the installed CLI file directly with Node; it does not use `bunx`, `npx`, an ambient global `pi`, or package self-update behavior.
+
+An upgrade is complete only after the Pi contract tests pass against the new exact version.
 
 ## File layout
 
 ```text
 marvin/
-├── index.ts                    # composition root only
-├── src/
-│   ├── config.ts               # environment and filesystem validation
-│   ├── discord.ts              # Discord ingress and direct output
-│   ├── marvin.ts               # user-visible orchestration
-│   ├── pi.ts                   # all Pi construction, admission, state, and events
-│   └── split-message.ts        # pure Discord-size splitter
-└── tests/
-    ├── config.test.ts
-    ├── discord.test.ts
-    ├── marvin.test.ts
-    ├── pi.test.ts
-    ├── pi-contract.test.ts
-    ├── split-message.test.ts
-    └── support.ts
+├── bin/
+│   └── marvin                  # POSIX launcher and SSH ForceCommand target
+├── config/
+│   └── system-prompt.md        # administrator-owned Marvin base prompt
+├── deploy/
+│   ├── marvin.conf             # installed as administrator-owned /etc/marvin.conf
+│   └── sshd_config             # dedicated-account policy example
+├── tests/
+│   ├── launcher.test.sh        # deterministic black-box launcher tests
+│   └── pi-contract.test.sh     # pinned CLI and pseudo-terminal contract tests
+├── package.json
+└── bun.lock
 ```
 
-Small types live with the module that owns them. The system prompt is a constant in `pi.ts` until its size or independent evolution justifies a separate file.
-
-Dependency direction is straightforward:
-
-```text
-index.ts -> config, discord, marvin, pi
-marvin.ts -> structural Pi and send dependencies
-discord.ts -> discord.js, split-message
-pi.ts -> Pi SDK, config
-```
-
-No module other than `discord.ts` imports `discord.js`, and no module other than `pi.ts` imports the Pi SDK.
+There are no `src/` modules. The launcher stays in one file because none of its behavior is reusable application logic.
 
 ## Configuration
 
-`src/config.ts` is the only module that reads environment variables.
+The launcher reads one fixed administrator-owned file, `/etc/marvin.conf`:
 
-```ts
-export const APPROVED_TOOLS = ['read', 'bash', 'grep', 'find', 'ls'] as const
+| Value | Default | Validation |
+| --- | --- | --- |
+| `MARVIN_WORKSPACE` | None | Required absolute path; canonical target is an existing readable and searchable directory. |
+| `MARVIN_SESSION_DIR` | `$HOME/.pi/agent/marvin/sessions` | Absolute path when provided; create with mode `0700` when absent; require read, write, and search access and no group/other permission bits. |
+| `MARVIN_NODE_BIN` | None | Required absolute path to the administrator-owned Node executable. |
 
-export interface MarvinConfig {
-  discordToken: string
-  workspace: string
-  sessionDir: string
-  model?: string
-}
+The default session path deliberately matches the existing Marvin Pi session location so completed conversations can survive the transport migration. The migration backs up this directory but does not convert or rewrite its JSONL files.
 
-export async function loadConfig(options: {
-  env?: Readonly<Record<string, string | undefined>>
-  defaultSessionDir: string
-}): Promise<MarvinConfig>
-```
+The release root determines the absolute Pi CLI and system-prompt paths. The configuration file is sourced only after its file and parent path are verified as administrator-owned and not writable by the Marvin account. The launcher also verifies that:
 
-`loadConfig` performs these checks before Discord login:
+- the effective account is not root;
+- `HOME` is an absolute directory owned by the deployment account;
+- the Node binary, `flock`, prompt, and installed CLI are readable regular files; and
+- stdin and stdout are attached to a PTY.
 
-- `DISCORD_TOKEN` is present and non-blank;
-- `MARVIN_WORKSPACE` is absolute, resolves through `realpath`, is a directory, and is readable/searchable;
-- `MARVIN_SESSION_DIR` defaults to a Marvin-specific Pi directory, is created with mode `0700` when absent, resolves through `realpath`, and is readable/writable/searchable;
-- the session directory has no group or other permission bits on POSIX; and
-- a present `MARVIN_MODEL` is non-blank.
+Installation and deployment acceptance, rather than every launch, verify that the Node binary, `flock`, complete release/dependency tree, and their parent paths are administrator-owned and not writable by the account.
 
-The Pi module performs model, authentication, effective-tool, settings, and resource validation because it owns the SDK objects needed for those checks. There is no `MARVIN_USER_ID` or `MARVIN_TOOLS` setting.
+The SSH client supplies no Marvin configuration. The account uses an administrator-controlled non-interactive login shell, executable lookup is fixed, and shell/runtime injection variables such as `ENV`, `BASH_ENV`, `LD_*`, and `NODE_OPTIONS` are absent before the forced command or removed before Node starts.
 
-## Discord transport
+## Launcher control flow
 
-`src/discord.ts` owns the Discord client, ingress conversion, and accepted DM channel.
-
-```ts
-export type DiscordIngress =
-  | { type: 'prompt'; text: string }
-  | { type: 'attachment_only' }
-
-export type IngressHandler = (event: DiscordIngress) => Promise<void>
-
-export class DiscordTransport {
-  constructor(clientFactory?: DiscordClientFactory)
-
-  start(
-    token: string,
-    onIngress: IngressHandler,
-    onFatal: () => void,
-  ): Promise<void>
-
-  send(text: string): Promise<void>
-}
-```
-
-The optional client factory is an internal test seam, not an application port.
-
-The client requests only the direct-message gateway behavior needed by the private application. For the pinned discord.js version, the intended construction is:
-
-```ts
-new Client({
-  intents: [GatewayIntentBits.DirectMessages],
-  partials: [Partials.Channel],
-})
-```
-
-Direct-message content availability without the privileged `MessageContent` intent must be confirmed by a local Discord smoke test. The intent is added only if that test demonstrates it is required.
-
-Ingress conversion is strict:
+`bin/marvin` uses `umask 077` and follows this order:
 
 ```text
-message.author.bot                       -> ignore
-message.channel.type !== ChannelType.DM -> ignore
-trimmed content empty + attachments      -> attachment_only
-trimmed content empty                    -> ignore
-otherwise                                -> prompt with original content
+require TTY stdin and stdout
+  -> reject a non-empty SSH_ORIGINAL_COMMAND
+  -> validate account, configuration, release files, workspace, and session directory
+  -> open the fixed administrator-owned lock inode read-only on descriptor 9
+  -> util-linux flock --exclusive --nonblock --conflict-exit-code 75 descriptor 9
+  -> if held: print "Marvin is already active." and exit non-zero
+  -> cd to the canonical workspace
+  -> exec Pi with descriptor 9 still open
 ```
 
-No author-ID check is performed. Private application visibility is the authorization boundary defined by the product and architecture.
+The lock path is fixed at `/var/lock/marvin/instance.lock`. Deployment creates it as a regular file under an administrator-owned, account-non-writable directory on a local filesystem. The launcher opens the existing inode without truncation and rejects a missing, symbolic-link, or non-regular path. Exit code `75` means contention; other open or `flock` failures are configuration errors.
 
-The `MessageCreate` listener attaches a terminal catch to every ingress promise. The Discord client also has an `error` listener, so an EventEmitter rejection or error cannot become an unhandled process failure.
+The lock is acquired before Pi can run migrations or inspect a session. The shell then `exec`s Node, so Pi inherits the lock descriptor, stdin, stdout, stderr, terminal size, process identity, and foreground process group unchanged. Pi's normal exit, signal death, or crash closes the descriptor and releases the lock. There is no launcher supervisor, signal forwarding, restart, PID file, heartbeat, stale-lock timeout, or cleanup protocol.
 
-On the first accepted event, the transport records its one-to-one DM as the sole output destination. Every send uses:
+The pinned runtime contract verifies that Pi and its normal tool subprocesses do not retain the lock beyond Pi's process lifetime. Trusted extensions that deliberately duplicate inherited descriptors are outside the supported contract.
 
-```ts
-{
-  content,
-  allowedMentions: { parse: [], repliedUser: false },
-}
-```
+Startup errors use fixed safe text and exit non-zero:
 
-`send(text)` immediately:
-
-1. calls `splitMessage(text)`;
-2. sends each chunk sequentially;
-3. stops that logical response after a terminal send failure.
-
-Separate calls to `send()` are not coordinated and may interleave. There is no application retry clock. discord.js handles rate limits; ambiguous transport retries could duplicate a chunk. Delivery remains best effort after a send failure.
-
-## Message splitting
-
-`src/split-message.ts` exports one pure function:
-
-```ts
-export function splitMessage(source: string, limit = 2_000): string[]
-```
-
-Its invariants are:
-
-1. a `limit` that is not a safe integer of at least `2` throws `RangeError` because a UTF-16 surrogate pair needs two code units;
-2. empty input returns `[]`;
-3. every returned chunk is non-empty and at most `limit` UTF-16 code units;
-4. `chunks.join('') === source`;
-5. break selection prefers paragraph, newline, whitespace, then a hard boundary;
-6. a hard boundary never divides a UTF-16 surrogate pair; and
-7. the algorithm always consumes at least one source character.
-
-Empty final assistant text is replaced before splitting with `I finished, but there was no text response.` Markdown fence reconstruction is deliberately omitted because it conflicts with bounded output for pathological fence lines and is not required to preserve source text.
-
-## Pi assistant
-
-`src/pi.ts` owns every Pi SDK object, the active session subscription, admission state, failure handling, and raw event reduction.
-
-### Application-facing API
-
-```ts
-export type Admission =
-  | { kind: 'started' }
-  | { kind: 'busy' }
-  | { kind: 'unavailable' }
-  | { kind: 'failed'; fatal: boolean }
-
-export type AssistantOutcome =
-  | { type: 'answer'; text: string }
-  | { type: 'failure'; reason: 'request_failed' }
-  | { type: 'fatal'; reason: 'runtime_failed' }
-
-export class PiAssistant {
-  static defaultSessionDir(): string
-  static create(config: MarvinConfig): Promise<PiAssistant>
-
-  subscribe(listener: (outcome: AssistantOutcome) => void): () => void
-  admit(text: string): Promise<Admission>
-}
-```
-
-The application never sees session IDs, raw Pi events, model objects, tool state, or other SDK state.
-
-### Construction
-
-`PiAssistant.create`:
-
-1. creates Pi authentication, model, settings, and resource services for the validated workspace;
-2. disables extensions, skills, prompt templates, themes, context files, and package-provided executable resources;
-3. applies an application-owned system prompt;
-4. selects only `APPROVED_TOOLS` and verifies the effective tool set;
-5. resolves an exact configured model or Pi's valid default model;
-6. verifies model authentication without exposing credential details;
-7. continues the most recent usable session through Pi's session APIs; and
-8. binds one event listener to the active session.
-
-Pi settings that can alter shell execution or load packages must not be inherited unchecked. The exact pinned SDK calls required to sanitize those settings and resources are established by `pi-contract.test.ts`, not duplicated as an architectural dependency throughout the application.
-
-The application system prompt identifies Marvin as a concise Discord assistant, permits approved tools for user-requested work, requires truthful tool reporting, and asks for clarification before materially ambiguous actions. It contains no credentials or claims that the workspace is a sandbox. Pi may add provider-visible runtime context such as the current working directory.
-
-### Atomic admission
-
-`admit()` checks state and sets its active-run marker before its first await:
-
-```text
-permanently closed
-  -> unavailable
-
-session streaming
-  -> busy without calling a Pi prompt API or retaining text
-
-session idle
-  -> start prompt
-  -> attach completion failure handling immediately
-  -> await only Pi's prompt-preflight acceptance boundary
-  -> started or failed
-```
-
-Later Discord events observe the active-run marker and receive `busy` promptly.
-
-Expected Pi preflight rejections are reduced to `{ kind: 'failed', fatal }`; they do not escape to the Discord listener's terminal catch. Rejected prompt text is not retained. `fatal` is true only when the Pi assistant can no longer admit work safely, in which case it marks itself permanently closed before returning.
-
-Pi remains the only owner of prompt text after admission. Because every answer goes to the same private DM and only one prompt can run, Marvin keeps no pending prompt text, message IDs, or channel IDs. Discord responses are sent directly and may complete in any order.
-
-The completion promise from an initial `prompt()` always has a rejection handler attached before admission returns. A late rejection becomes exactly one safe failure outcome unless the assistant is permanently closed.
-
-### Event reduction
-
-Raw Pi events are handled entirely in `pi.ts`:
-
-| Pi event | Behavior |
+| Condition | Text |
 | --- | --- |
-| Agent start | Ignore. |
-| Agent settled | Resolve the active run and emit a failure if it produced no terminal outcome. |
-| Message update | Ignore token deltas. |
-| Assistant message containing a tool-call block | Treat as intermediate, regardless of stop reason. |
-| Assistant `error` result | Wait for Pi's terminal retry decision. |
-| Assistant `aborted` result | Ignore. |
-| Terminal assistant message without tool calls | Concatenate text blocks in source order and emit one answer. |
-| Terminal agent failure after retries | Emit one safe failure. |
-| Tool events | Do not forward arguments, results, or commands. |
+| No interactive PTY | `Marvin requires an interactive SSH terminal.` |
+| Client requested a remote command or subsystem | `Marvin does not accept remote commands.` |
+| Lock held | `Marvin is already active.` |
+| Lock unavailable or invalid | `Marvin cannot start: instance lock unavailable.` |
+| Invalid local deployment input | `Marvin cannot start: <actionable local reason>.` |
 
-Thinking and non-text content are never included in Discord output. After a terminal request failure, Pi settlement returns the assistant to `idle`; until then, admission remains `busy`. Application listener failures are caught so they cannot reject back into Pi's event pipeline.
+Local errors may identify the setting that needs repair, but do not print credentials or provider data. Once Pi starts, its output and errors pass through unchanged.
 
-### Failure handling
+## Pi invocation
+
+With validated absolute paths, the launcher runs:
+
+```sh
+"$MARVIN_NODE_BIN" "$PI_CLI" \
+  --continue \
+  --session-dir "$MARVIN_SESSION_DIR" \
+  --tools read,bash,grep,find,ls \
+  --system-prompt "$MARVIN_SYSTEM_PROMPT"
+```
+
+No initial message is supplied, so TTY input and output select Pi's interactive mode. The design intentionally omits:
+
+- `--mode`, `--print`, and RPC options because Pi owns the TUI;
+- `--model`, `--provider`, and `--thinking` because Pi's session and settings own model selection;
+- resource-disabling flags because Pi-native trusted settings, extensions, skills, templates, themes, and context files remain available; and
+- API keys because Pi uses its standard credential mechanisms.
+
+`--continue` asks Pi `0.82.1` to open the newest discoverable session for the current workspace in the dedicated session directory, or to create one if none exists. It is a continuation convention, not a permanent current-session pointer. Pi-native `/new`, `/resume`, `/tree`, `/fork`, `/clone`, and `/import` controls remain available, but Marvin adds no session controls and promises no workflow around switching.
+
+## Base prompt and tools
+
+`config/system-prompt.md` contains only stable Marvin behavior:
 
 ```text
-terminal failure
-  emit one safe failure outcome
-  allow new admission after Pi settles
-
-fatal runtime failure
-  mark permanently closed
-  emit one fatal outcome
-
+You are Marvin, a personal AI assistant for one user.
+Give clear, concise, useful answers. Use the available tools when they help complete the user's request. Report actions and failures truthfully. Ask a focused question before taking a materially ambiguous or destructive action.
 ```
 
-## Marvin application
+The file contains no credentials, deployment paths, terminal assumptions, or claim that the workspace is a sandbox.
 
-`src/marvin.ts` contains no Discord or Pi SDK imports. Its dependencies are structural and small:
+The initial model-facing tool allowlist is `read`, `bash`, `grep`, `find`, and `ls`. `bash` supplies the required shell access; the other names preserve direct read and search behavior without granting Pi's built-in file-mutation tools by default.
 
-```ts
-interface AssistantDependency {
-  admit(text: string): Promise<Admission>
-}
+This is an initial behavior policy, not an isolation boundary. Pi may append trusted context files and skills to the base prompt. Trusted extensions can change runtime behavior, register same-named tools, or change active tools. The dedicated OS identity or container remains responsible for filesystem, process, and network restrictions.
 
-type Send = (text: string) => Promise<void>
-type FatalHandler = () => void
+## Pi-owned behavior
 
-export class Marvin {
-  constructor(
-    assistant: AssistantDependency,
-    send: Send,
-    onFatal: FatalHandler,
-  )
-  handle(event: DiscordIngress): Promise<void>
-  handleOutcome(outcome: AssistantOutcome): void
-}
-```
+Marvin adds no code for these product features:
 
-Marvin does not parse user-facing commands. Every accepted text DM, including text beginning with `!`, is passed unchanged to `admit()`.
-
-Prompt behavior is:
-
-```text
-attachment only -> Text messages only for now.
-started         -> no acknowledgement
-busy            -> Marvin is already working; try again after it finishes.
-unavailable     -> Marvin is temporarily unavailable; try again in a moment.
-failed          -> report not accepted; suggest retry only when nonfatal; otherwise call onFatal
-```
-
-An answer is sent verbatim unless empty, in which case the standard fallback is used. A nonfatal admission failure says that the request was not accepted and can be retried. A fatal admission failure says Marvin must restart and invokes `onFatal()`. A terminal request failure suggests retrying. A fatal outcome sends a safe response if possible and invokes `onFatal()`.
-
-`handleOutcome` never awaits Discord from inside a Pi callback. It starts the send directly and attaches a terminal catch to the returned promise.
-
-## Composition
-
-`index.ts` is a direct composition root:
-
-```ts
-load configuration
-create Pi assistant
-create Discord transport and Marvin
-subscribe Marvin to Pi outcomes
-start Discord
-```
-
-Invalid startup state rejects the top-level await. Fatal callbacks call `process.exit(1)`. No signal handlers or graceful shutdown path are installed.
-
-## Required Pi contract checks
-
-`tests/pi-contract.test.ts` is mandatory and uses a temporary session directory plus a fake/local provider without user credentials or external network access. It verifies the assumptions most likely to change between SDK versions:
-
-- Bun can import and construct the exactly pinned Pi version;
-- prompt preflight resolves before the complete model run;
-- session streaming state is observable after prompt acceptance and until settlement;
-- preflight rejections become admission failures without retaining prompt text;
-- admission while streaming returns busy without forwarding or retaining prompt text;
-- `length` responses containing tool calls continue rather than becoming final output;
-- terminal answer, retry, and failure event sequences match the reducer;
-- continuing the most recent usable session follows Pi's persistence behavior; and
-- effective settings, resources, packages, model, authentication, and tools match application policy.
-
-If these checks cannot be implemented against `0.82.1`, dependency selection and this document must be updated before application code proceeds.
-
-## Test design
-
-Tests use Bun's test runner and injected factories/functions. They do not connect to Discord or a paid model provider.
-
-| Test | Primary coverage |
+| Product behavior | Owner |
 | --- | --- |
-| `config.test.ts` | Missing values, canonical directories, permissions, optional model. |
-| `discord.test.ts` | Bot/non-DM/group filtering, attachment-only input, original text, safe mentions, direct concurrent sends, send failures, listener catches. |
-| `split-message.test.ts` | Invalid limits, empty and boundary lengths, preferred breaks, long unbroken text, surrogate pairs, length and source-preservation properties. |
-| `marvin.test.ts` | All text forwarded unchanged, silent start, busy/unavailable/failure results, and fatal outcomes. |
-| `pi.test.ts` | Admission, busy rejection without text retention, preflight rejection mapping, event reduction, and failure handling. |
-| `pi-contract.test.ts` | Real pinned-SDK behavior listed above. |
+| Non-empty prompt submission and accepted feedback | Pi editor and TUI |
+| Steering with Enter during a run | Pi steering queue |
+| Follow-up with Alt+Enter during a run | Pi follow-up queue |
+| Immediate queued-state display and queue retrieval | Pi TUI |
+| Ordered response, progress, thinking, and tool display | Pi TUI on one PTY |
+| Model and tool retries and actionable request errors | Pi runtime and TUI |
+| Completed conversation continuity | Pi JSONL session manager |
+| Model login, selection, thinking level, and settings | Pi-native commands and settings |
 
-`tests/support.ts` contains only shared fakes that are used by more than one test file.
+Ordinary prompts use queue semantics. Slash commands, `!` shell commands, and other Pi controls retain their own native behavior. If the pinned release fails any required behavior, the dependency or the product requirement must change; Marvin does not add an interception layer.
+
+## SSH deployment
+
+The repository's `deploy/sshd_config` documents a policy equivalent to:
+
+```text
+PermitUserEnvironment no
+
+Match User marvin
+    PubkeyAuthentication yes
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+    AuthorizedKeysCommand none
+    TrustedUserCAKeys none
+    PermitTTY yes
+    ForceCommand /opt/marvin/bin/marvin
+    DisableForwarding yes
+    PermitUserRC no
+    ClientAliveInterval 30
+    ClientAliveCountMax 2
+
+Match all
+```
+
+This fragment is included from global scope and explicitly closes its `Match` block. Exact directive support and precedence are validated with `sshd -T -C` on the target server. The effective policy must ensure that:
+
+- only the sole user's administrator-managed public keys authenticate;
+- no global authorized-keys command, trusted CA, or other authentication method adds credentials;
+- the Marvin account cannot modify its authorized-key source, launcher, prompt, or SSH policy;
+- shell, command, subsystem, and forwarding requests cannot bypass the forced launcher;
+- no effective `AcceptEnv` pattern accepts names that affect Marvin, Pi, Node, executable lookup, or shell startup;
+- the account's administrator-controlled login shell cannot execute user startup files before the forced command; and
+- a normal client requests and receives a PTY with an empty `SSH_ORIGINAL_COMMAND`.
+
+The workspace and session directory may be writable by the dedicated account. They are trusted application data, not administrator-owned executable policy. The lock file, `/etc/marvin.conf`, Node runtime, `flock`, release tree, and their parent directories are not account-writable. Server keepalives bound detection of an unresponsive client to approximately 60 seconds after the last successful response.
+
+## Verification
+
+### Launcher tests
+
+`tests/launcher.test.sh` uses temporary directories, a fake Pi executable, and a pseudo-terminal. It verifies:
+
+- missing PTY and remote-command requests fail before Pi starts;
+- required, relative, missing, inaccessible, and insecure paths fail safely;
+- a new session directory is private and an existing insecure directory is rejected;
+- a missing, replaced, symbolic-link, or non-regular lock target is rejected;
+- Pi receives the exact argument vector and canonical working directory;
+- stdin, stdout, stderr, `TERM`, UTF-8 locale, and resize signals reach Pi unchanged;
+- a second launch reports busy immediately and never starts Pi;
+- `exec` leaves no launcher supervisor and Pi receives SSH signals directly;
+- the inherited descriptor holds the lock for exactly Pi's lifetime and normal tool subprocesses do not extend it; and
+- normal exit, failure, and forced termination release the lock without stale cleanup.
+
+### Pi contract tests
+
+`tests/pi-contract.test.sh` runs the real pinned CLI under a pseudo-terminal with Pi's credential-free local/faux provider where possible. It verifies:
+
+- the direct CLI reports version `0.82.1` and starts in interactive mode;
+- the exact tool names and base prompt are effective while native trusted resources still load;
+- first launch creates a native session and the next launch continues completed context;
+- idle submission displays accepted/working feedback;
+- Enter and Alt+Enter during a slow run display and deliver steering and follow-up queues in native order;
+- ordinary response text and tool activity remain ordered;
+- a recoverable model or tool failure is actionable and returns Pi to an input-ready state; and
+- an unavailable session directory fails, while corrupt/non-discoverable files and Pi-native session migration behavior are documented and tested against backup copies.
+
+### Deployment acceptance
+
+The target host is not released until manual SSH checks confirm:
+
+- unauthorized, password, command, subsystem, environment, and forwarding attempts are rejected;
+- two concurrent desktop/mobile connections produce one TUI and one immediate busy result;
+- supported desktop and mobile clients handle UTF-8, paste, resize, Enter, Alt+Enter, Escape, and Alt+Up;
+- completed context survives a clean exit and process restart;
+- a network drop loses no already-persisted context, replays no unseen output, ends Pi within the keepalive bound, and releases the lock; and
+- missing/expired provider authentication, model failure, and tool failure produce useful native terminal guidance without exposing credentials.
+
+## Migration from the Discord implementation
+
+Implementation of this design removes `index.ts`, `src/`, the Discord/message-splitting tests, `discord.js`, the direct Pi SDK adapter, and TypeScript-only development dependencies. No compatibility transport or dormant Discord code remains.
+
+Before removal, the existing native Pi session directory is backed up. The new launcher uses the same default directory and validates continuation and any Pi-native format migration against a copy before opening the authoritative JSONL. Marvin never parses or rewrites session files itself. Discord tokens and configuration are then removed from the runtime environment and documentation.

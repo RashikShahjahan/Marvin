@@ -1,22 +1,15 @@
 {
   "name": "marvin",
-  "module": "index.ts",
-  "type": "module",
   "private": true,
   "scripts": {
-    "start": "bun run index.ts",
-    "test": "bun test",
-    "typecheck": "tsc --noEmit"
-  },
-  "devDependencies": {
-    "@earendil-works/pi-ai": "0.82.1",
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
+    "start": "./bin/marvin",
+    "test": "sh tests/launcher.test.sh && sh tests/pi-contract.test.sh",
+    "check": "sh -n bin/marvin tests/launcher.test.sh tests/pi-contract.test.sh"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.82.1",
-    "discord.js": "14.26.4"
+    "@earendil-works/pi-coding-agent": "0.82.1"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   }
 }

@@ -14,8 +14,8 @@ The user needs to:
 - ask open-ended questions and receive clear, useful responses;
 - instruct the assistant to perform agentic tasks with shell access;
 - continue a conversation without repeatedly restating context;
-- know whether a request was accepted, rejected because Marvin is busy, or failed;
-- receive immediate feedback when the assistant is already working;
+- know whether a request was accepted, queued because Marvin is working, or failed;
+- receive immediate feedback when a prompt is queued;
 - keep the assistant private to its sole user.
 
 ## Access assumption
@@ -30,15 +30,15 @@ Input submitted through an authenticated SSH session to Pi's TUI is treated as a
 - Support Pi's TUI through compatible SSH clients on desktop and mobile.
 - Accept non-empty text submitted through an authenticated TUI session.
 - Preserve completed conversational context across process restarts.
-- Reject additional prompts while a response is running without retaining their text.
-- Report concise accepted, busy, and failed outcomes.
+- Preserve Pi's native steering and follow-up queue behavior while a response is running.
+- Report concise accepted, queued, and failed outcomes.
 - Display all response text in order through Pi's TUI.
 - Return a concise, actionable error when an accepted request fails.
 - Allow the agent to use approved tools, including shell commands.
 
 ## Operating limits
 
-- In-flight work may be lost when the process exits unexpectedly.
+- In-flight work, including queued prompts, may be lost when the process exits unexpectedly.
 - An interrupted SSH session may lose in-flight output. Durable or exactly-once output delivery is out of scope for the first release.
-- User-facing control commands and conversation switching are out of scope for the first release.
+- Marvin-specific control commands and conversation-switching behavior are out of scope for the first release.
 - Detached host processes are unsupported.

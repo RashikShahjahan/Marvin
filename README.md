@@ -1,5 +1,7 @@
 # Marvin
 
+> **Implementation status:** The checked-in application and setup below are the previous Discord prototype. The proposed SSH and native Pi TUI release is specified in [`product.md`](./product.md), [`architecture.md`](./architecture.md), and [`program-design.md`](./program-design.md); it has not been implemented yet.
+
 Marvin is a private, single-user AI assistant reached through Discord direct messages. It runs as
 one Bun process and stores conversation history in Pi's native JSONL session format.
 
